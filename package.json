@@ -1,0 +1,43 @@
+{
+	"id": "aiRag",
+	"name": "{{LNG['aiRag.meta.name']}}",
+	"title": "{{LNG['aiRag.meta.title']}}",
+	"version": "1.6.4",
+	"category": "tools,company",
+	"source": {
+		"thumb": "{{pluginHost}}static/icon.svg",
+		"className": "font-icon ri-robot-line bg-purple-6"
+	},
+	"description": "{{LNG['aiRag.meta.desc']}}",
+	"auther": {
+		"copyright": "KodBox community plugin",
+		"homePage": "https://github.com/d1ngx/aiRag"
+	},
+	"configItem": {
+		"pluginAuth": {
+			"type": "userSelect",
+			"value": {"all": 1},
+			"display": "{{LNG['admin.plugin.auth']}}",
+			"desc": "{{LNG['admin.plugin.authDesc']}}",
+			"require": 1
+		},
+		"menuAdd": {
+			"type": "switch",
+			"value": 1,
+			"display": "{{LNG['admin.plugin.menuAdd']}}",
+			"desc": "{{LNG['admin.plugin.menuAddDesc']}}",
+			"switchItem": {"0": "", "1": "menuSubMenu"}
+		},
+		"menuSubMenu": {
+			"type": "switch",
+			"value": 0,
+			"display": "{{LNG['admin.setting.subMenu']}}",
+			"desc": "{{LNG['admin.plugin.menuSubMenuDesc']}}"
+		},
+		"text": {
+			"type": "html",
+			"display": "&nbsp;",
+			"value": "<a class='btn btn-success mr-10' link-href='#admin/setting/aiRag'>后台管理</a><a class='btn btn-default mr-10' href='./index.php#admin/setting/aiRag' target='_blank' rel='noopener'>新窗口配置</a><a class='btn btn-success' link-href='#aiRag'>立即进入</a>"
+		}
+	}
+}
