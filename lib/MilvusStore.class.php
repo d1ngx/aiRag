@@ -16,11 +16,12 @@ class AiRagMilvusStore {
 	}
 
 	public function info($timeout = 8) {
-		return $this->post('/v2/vectordb/collections/list', array(), $timeout, array(200, 201));
+		return $this->post('/v2/vectordb/collections/list', (object)array(), $timeout, array(200, 201));
 	}
 
 	public function ensureInfrastructure() {
 		if (!$this->collectionExists()) $this->createCollection();
+		$this->validateSchema();
 		$this->post('/v2/vectordb/collections/load', array('collectionName' => $this->collection), 20, array(200, 201));
 		return true;
 	}
@@ -44,7 +45,8 @@ class AiRagMilvusStore {
 		$response = $this->post('/v2/vectordb/entities/query', array(
 			'collectionName' => $this->collection,
 			'filter' => 'file_id == '.intval($fileID),
-			'outputFields' => array('chunk_index', 'content_hash'),
+			'outputFields' => array('chunk_index', 'content_hash', 'source_id', 'parent_id', 'modify_time', 'name', 'ext'),
+			'consistencyLevel' => 'Strong',
 			'limit' => 4096,
 		), 20, array(200, 201));
 		$rows = (array)_get($response, 'data', $response);
@@ -55,15 +57,15 @@ class AiRagMilvusStore {
 			$index = intval(_get($entity, 'chunk_index', _get($hit, 'chunk_index', -1)));
 			$hash = (string)_get($entity, 'content_hash', _get($hit, 'content_hash', ''));
 			if ($index < 0 || $hash === '') continue;
-			$out[$index] = $hash;
+			$out[$index] = $entity;
 		}
 		return $out;
 	}
 
-	public function listByFile($fileID, $limit = 200) {
+	public function listByFile($fileID, $limit = 200, $chunkIndex = null) {
 		$response = $this->post('/v2/vectordb/entities/query', array(
 			'collectionName' => $this->collection,
-			'filter' => 'file_id == '.intval($fileID),
+			'filter' => 'file_id == '.intval($fileID).($chunkIndex === null ? '' : ' && chunk_index == '.intval($chunkIndex)),
 			'outputFields' => array('chunk_id', 'chunk_index', 'text', 'name', 'content_hash'),
 			'limit' => max(1, min(400, intval($limit))),
 		), 20, array(200, 201));
@@ -107,6 +109,7 @@ class AiRagMilvusStore {
 			'collectionName' => $this->collection,
 			'data' => array($vector),
 			'annsField' => 'vector',
+			'consistencyLevel' => 'Strong',
 			'limit' => max(1, intval($limit)),
 			'outputFields' => array('file_id', 'chunk_index', 'text', 'name', 'ext', 'source_id'),
 			'searchParams' => array('metricType' => 'COSINE'),
@@ -115,7 +118,7 @@ class AiRagMilvusStore {
 		if ($expr !== '') $body['filter'] = $expr;
 		$response = $this->post('/v2/vectordb/entities/search', $body, 20);
 		$hits = _get($response, 'data', array());
-		if (isset($hits[0]) && is_array($hits[0]) && isset($hits[0]['id'])) $rows = $hits;
+		if (isset($hits[0]) && is_array($hits[0]) && (isset($hits[0]['id']) || isset($hits[0]['chunk_id']) || isset($hits[0]['file_id']) || isset($hits[0]['entity']))) $rows = $hits;
 		else $rows = (array)_get($hits, 0, $hits);
 		$result = array();
 		foreach ((array)$rows as $rank => $hit) {
@@ -137,7 +140,9 @@ class AiRagMilvusStore {
 	}
 
 	public function rebuild() {
-		$this->post('/v2/vectordb/collections/drop', array('collectionName' => $this->collection), 20, array(200, 201));
+		if ($this->collectionExists()) {
+			$this->post('/v2/vectordb/collections/drop', array('collectionName' => $this->collection), 20, array(200, 201));
+		}
 		return $this->ensureInfrastructure();
 	}
 
@@ -145,21 +150,21 @@ class AiRagMilvusStore {
 		return intval($fileID).':'.intval($chunkIndex);
 	}
 
-	public static function chunkHash($text) {
-		return sha1((string)$text);
+	public static function chunkHash($text, $model = '') {
+		return sha1($model === '' ? (string)$text : $model."\0".(string)$text);
 	}
 
-	public static function diffChunks($chunks, $existing) {
+	public static function diffChunks($chunks, $existing, $model = '') {
 		$existing = is_array($existing) ? $existing : array();
 		$wanted = array();
 		$work = array();
 		$reuse = array();
 		foreach ((array)$chunks as $chunk) {
 			$index = intval(_get($chunk, 'index', 0));
-			$hash = self::chunkHash(_get($chunk, 'text', ''));
+			$hash = self::chunkHash(_get($chunk, 'text', ''), $model);
 			$wanted[$index] = $hash;
 			$chunk['hash'] = $hash;
-			if (isset($existing[$index]) && (string)$existing[$index] === $hash) $reuse[] = $index;
+			if (isset($existing[$index]) && (string)(is_array($existing[$index]) ? _get($existing[$index], 'content_hash', '') : $existing[$index]) === $hash) $reuse[] = $index;
 			else $work[] = $chunk;
 		}
 		$stale = array();
@@ -174,6 +179,7 @@ class AiRagMilvusStore {
 		$filter = is_array($filter) ? $filter : array();
 		$parts = array();
 		$ids = array_values(array_filter(array_map('intval', (array)$fileIDs)));
+		if ($fileIDs !== null && !$ids) $parts[] = 'file_id < 0';
 		if ($ids) $parts[] = 'file_id in ['.implode(',', $ids).']';
 		$source = intval(_get($filter, 'sourceID', 0));
 		if ($source) $parts[] = 'source_id == '.$source;
@@ -193,8 +199,8 @@ class AiRagMilvusStore {
 			'source_id' => intval(_get($meta, 'sourceID', 0)),
 			'parent_id' => intval(_get($meta, 'parentID', 0)),
 			'chunk_index' => intval(_get($meta, 'index', 0)),
-			'text' => mb_substr((string)_get($meta, 'text', ''), 0, 8000),
-			'name' => mb_substr((string)_get($meta, 'name', ''), 0, 500),
+			'text' => mb_strcut((string)_get($meta, 'text', ''), 0, 8192, 'UTF-8'),
+			'name' => mb_strcut((string)_get($meta, 'name', ''), 0, 512, 'UTF-8'),
 			'ext' => substr(strtolower(preg_replace('/[^a-z0-9]+/', '', (string)_get($meta, 'ext', ''))), 0, 16),
 			'content_hash' => (string)_get($meta, 'hash', self::chunkHash(_get($meta, 'text', ''))),
 			'modify_time' => intval(_get($meta, 'modifyTime', 0)),
@@ -203,11 +209,7 @@ class AiRagMilvusStore {
 	}
 
 	private function collectionExists() {
-		try {
-			$has = $this->post('/v2/vectordb/collections/has', array('collectionName' => $this->collection), 8, array(200, 201));
-		} catch (Throwable $e) {
-			return false;
-		}
+		$has = $this->post('/v2/vectordb/collections/has', array('collectionName' => $this->collection), 8, array(200, 201));
 		$exists = _get($has, 'data', _get($has, 'has', false));
 		if (is_array($exists)) $exists = !empty($exists['has']) || !empty($exists['exists']);
 		return !!$exists;
@@ -241,15 +243,45 @@ class AiRagMilvusStore {
 	}
 
 	private function createIndex($field, $name, $params) {
-		try {
-			$this->post('/v2/vectordb/indexes/create', array(
-				'collectionName' => $this->collection,
-				'indexParams' => array(array_merge(array(
-					'fieldName' => $field,
-					'indexName' => $name,
-				), $params)),
-			), 30, array(200, 201));
-		} catch (Throwable $e) {}
+		$this->post('/v2/vectordb/indexes/create', array(
+			'collectionName' => $this->collection,
+			'indexParams' => array(array_merge(array('fieldName' => $field, 'indexName' => $name), $params)),
+		), 30, array(200, 201));
+	}
+
+	private function validateSchema() {
+		$result = $this->post('/v2/vectordb/collections/describe', array('collectionName' => $this->collection));
+		$fields = array();
+		foreach ((array)_get(_get($result, 'data', array()), 'fields', array()) as $field) $fields[$field['name']] = $field;
+		$required = array('chunk_id'=>'VarChar','file_id'=>'Int64','source_id'=>'Int64','parent_id'=>'Int64','chunk_index'=>'Int64','text'=>'VarChar','name'=>'VarChar','ext'=>'VarChar','content_hash'=>'VarChar','modify_time'=>'Int64','vector'=>'FloatVector');
+		foreach ($required as $name=>$type) {
+			if (!isset($fields[$name]) || strcasecmp((string)_get($fields[$name], 'type', ''), $type) !== 0) throw new RuntimeException('Milvus 集合结构不兼容，请备份后重建 AIRAG 向量索引');
+		}
+		foreach ((array)_get($fields['vector'], 'params', array()) as $param) {
+			if (_get($param, 'key', '') === 'dim' && intval($param['value']) !== $this->dim) throw new RuntimeException('Milvus 集合维度与 Embedding 配置不一致，请重建向量索引');
+		}
+	}
+
+	public function refreshMetadata($fileID, $indexes, $file) {
+		foreach (array_chunk(array_values($indexes), 50) as $batch) {
+			$response = $this->post('/v2/vectordb/entities/query', array(
+				'collectionName'=>$this->collection,
+				'filter'=>'file_id == '.intval($fileID).' && chunk_index in ['.implode(',', array_map('intval', $batch)).']',
+				'outputFields'=>array('chunk_id','file_id','source_id','parent_id','chunk_index','text','name','ext','content_hash','modify_time','vector'),
+				'limit'=>count($batch), 'consistencyLevel'=>'Strong',
+			));
+			$rows = (array)_get($response, 'data', array());
+			if (count($rows) !== count($batch)) throw new RuntimeException('复用分片已变化，请重试');
+			foreach ($rows as &$row) {
+				$row['source_id'] = intval(_get($file,'sourceID',0));
+				$row['parent_id'] = intval(_get($file,'parentID',0));
+				$row['modify_time'] = intval(_get($file,'modifyTime',0));
+				$row['name'] = mb_strcut((string)_get($file,'name',''),0,512,'UTF-8');
+				$row['ext'] = substr(strtolower(preg_replace('/[^a-z0-9]+/','',(string)_get($file,'ext',''))),0,16);
+			}
+			unset($row);
+			$this->upsertChunks($rows, 50, intval(_get($this->config,'milvusPauseMs',700)));
+		}
 	}
 
 	private function headers() {
@@ -259,6 +291,8 @@ class AiRagMilvusStore {
 	}
 
 	private function post($path, $body, $timeout = 20, $allowed = array(200, 201)) {
-		return AiRagHttpJson::request('POST', $this->url.$path, $body, $this->headers(), $timeout, $allowed);
+		$result = AiRagHttpJson::request('POST', $this->url.$path, $body, $this->headers(), $timeout, $allowed);
+		if (!array_key_exists('code', $result) || !is_numeric($result['code']) || intval($result['code']) !== 0) throw new RuntimeException('Milvus '.$path.' 失败：'.(string)_get($result, 'message', '无效业务响应'));
+		return $result;
 	}
 }

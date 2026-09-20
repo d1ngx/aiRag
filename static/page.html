@@ -4,7 +4,7 @@
 	<meta charset="utf-8">
 	<meta name="viewport" content="width=device-width,initial-scale=1">
 	<title>AI 助手</title>
-	<link rel="stylesheet" href="<?php echo $this->pluginHost; ?>static/chat.css?v=1.6.4">
+	<link rel="stylesheet" href="<?php echo $this->pluginHost; ?>static/chat.css?v=<?php echo intval(@filemtime($this->pluginPath.'static/chat.css')); ?>">
 </head>
 <body class="airag-page">
 <div class="airag-app">
@@ -107,6 +107,6 @@
 window.AIRAG_API = <?php echo json_encode(rtrim(isset($this->pluginApi) ? $this->pluginApi : './index.php?plugin/aiRag/', '/').'/', JSON_UNESCAPED_SLASHES); ?>;
 window.AIRAG_BOOT = <?php echo json_encode(isset($this->airagBoot) ? $this->airagBoot : array(), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES); ?>;
 </script>
-<?php echo '<script src="'.$this->pluginHost.'static/page.js?v=1.6.4"></script>'; ?>
+<?php echo '<script src="'.$this->pluginHost.'static/page.js?v='.intval(@filemtime($this->pluginPath.'static/page.js')).'"></script>'; ?>
 </body>
 </html>

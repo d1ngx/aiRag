@@ -1,59 +1,52 @@
 <?php
-if (PHP_SAPI !== 'cli') { http_response_code(404); exit; }
+if (PHP_SAPI !== 'cli') {http_response_code(404);exit;}
 function _get($a,$k,$d=null){return isset($a[$k])?$a[$k]:$d;}
-function write_log($message){throw new RuntimeException($message);}
-define('TEMP_PATH',sys_get_temp_dir().'/airag-vector-test-'.getmypid()); mkdir(TEMP_PATH);
-class PluginBase { public function getConfig(){return array('embedUrl'=>'mock','milvusBatch'=>50,'milvusPauseMs'=>0);} }
-class FakeModel {
- public static $state=array('status'=>1);
- public function where($a){return $this;} public function find(){return self::$state;}
- public function save($a){self::$state=$a;return true;}
-}
-function Model($name){return new FakeModel();}
+function write_log($message){}
+define('TEMP_PATH',sys_get_temp_dir().'/airag-vector-test-'.getmypid());mkdir(TEMP_PATH);
+class PluginBase {function getConfig(){return array('embedUrl'=>'mock','embedDim'=>32,'milvusBatch'=>50,'milvusPauseMs'=>0);}}
+class FakeModel {static $state=array('status'=>1);function where($a){return $this;}function find(){return self::$state;}function save($a){self::$state=$a;return true;}}
+function Model($name){return new FakeModel;}
 class AiRagPressureException extends RuntimeException {}
-class AiRagBackpressure { public static $calls=0; public static $pauseAt=8;
- public static function assertReady($config){if(++self::$calls===self::$pauseAt) throw new AiRagPressureException('test');} }
-class AiRagElasticStore { public function __construct($c){} public function getDocument($id){return array('content'=>'正文','modifyTime'=>1);} }
-class AiRagTextNormalizer { public static function clean($s){return $s;} }
-class AiRagTextChunker { public static function split($t,$s,$o,$p){$out=array();for($i=0;$i<120;$i++)$out[]=array('index'=>$i,'text'=>'chunk'.$i);return $out;} }
-class AiRagEmbedClient {public static $texts=array(); public function __construct($c){} public function embed($texts,$t){self::$texts=array_merge(self::$texts,$texts);return array_fill(0,count($texts),array(1,0));} }
-class AiRagMilvusStore {public static $deletes=0;public static $rows=array();public function __construct($c){}
- public function deleteFile($id){self::$deletes++;foreach(self::$rows as $k=>$r) if(intval($r['file_id'])==intval($id)) unset(self::$rows[$k]);}
- public function deleteChunks($id,$idx){foreach((array)$idx as $i) unset(self::$rows[self::chunkId($id,$i)]);}
- public function hashesByFile($id){$out=array();foreach(self::$rows as $r){if(intval($r['file_id'])==intval($id))$out[intval($r['chunk_index'])]=(string)$r['content_hash'];}return $out;}
- public static function chunkId($id,$n){return intval($id).':'.intval($n);}
- public static function chunkHash($t){return sha1((string)$t);}
- public static function diffChunks($chunks,$existing){
-  $existing=is_array($existing)?$existing:array();$wanted=array();$work=array();$reuse=array();
-  foreach((array)$chunks as $chunk){$index=intval(_get($chunk,'index',0));$hash=self::chunkHash(_get($chunk,'text',''));$wanted[$index]=$hash;$chunk['hash']=$hash;
-   if(isset($existing[$index])&&(string)$existing[$index]===$hash)$reuse[]=$index; else $work[]=$chunk;}
-  $stale=array();foreach($existing as $index=>$_h){$index=intval($index);if(!isset($wanted[$index]))$stale[]=$index;}
-  return array('work'=>$work,'reuse'=>$reuse,'stale'=>$stale,'wanted'=>$wanted);
+class AiRagBackpressure {static $pause=true;static function assertReady($c){if(self::$pause&&count(AiRagHttpJson::$rows)>=50)throw new AiRagPressureException('test');}}
+class AiRagElasticStore {function __construct($c){}function getDocument($id){return array('content'=>'正文','modifyTime'=>999);}}
+class AiRagTextNormalizer {static function clean($s){return $s;}}
+class AiRagTextChunker {static $count=120;static $changed=false;static function split($t,$s,$o,$p){$r=array();for($i=0;$i<self::$count;$i++)$r[]=array('index'=>$i,'text'=>'chunk'.$i.(self::$changed&&$i===3?' updated':''));return $r;}}
+class AiRagEmbedClient {static $texts=array();static $version='m1';function __construct($c){}function fingerprint(){return self::$version;}function embed($texts,$timeout){self::$texts=array_merge(self::$texts,$texts);return array_fill(0,count($texts),array_fill(0,32,0.1));}}
+class AiRagHttpJson {
+ static $rows=array();static $failRead=false;static $failWrite=false;static $deletes=0;
+ static function fixUrl($u){return $u;}
+ static function request($method,$url,$body){
+  if(strpos($url,'/query')!==false){
+   if(self::$failRead)return array('code'=>1100,'message'=>'read error','_status'=>200);
+   $rows=array_values(self::$rows);
+   if(preg_match('/chunk_index in \[([^]]+)\]/',$body['filter'],$m)){$ids=array_map('intval',explode(',',$m[1]));$rows=array_values(array_filter($rows,function($r)use($ids){return in_array($r['chunk_index'],$ids);}));}
+   return array('code'=>0,'data'=>$rows);
+  }
+  if(strpos($url,'/upsert')!==false){if(self::$failWrite)return array('code'=>1100,'message'=>'write error','_status'=>200);foreach($body['data'] as $row)self::$rows[$row['chunk_id']]=$row;return array('code'=>0);}
+  if(strpos($url,'/delete')!==false){self::$deletes++;if(preg_match('/chunk_index in \[([^]]+)\]/',$body['filter'],$m)){foreach(explode(',',$m[1]) as $id)unset(self::$rows['42:'.intval($id)]);}else self::$rows=array();return array('code'=>0);}
+  throw new RuntimeException('Unexpected API '.$url);
  }
- public static function row($meta,$vector){
-  return array('chunk_id'=>self::chunkId(_get($meta,'fileID',0),_get($meta,'index',0)),'file_id'=>intval(_get($meta,'fileID',0)),'source_id'=>intval(_get($meta,'sourceID',0)),'parent_id'=>intval(_get($meta,'parentID',0)),'chunk_index'=>intval(_get($meta,'index',0)),'text'=>(string)_get($meta,'text',''),'name'=>(string)_get($meta,'name',''),'ext'=>(string)_get($meta,'ext',''),'content_hash'=>(string)_get($meta,'hash',self::chunkHash(_get($meta,'text',''))),'modify_time'=>intval(_get($meta,'modifyTime',0)),'vector'=>$vector);
- }
- public function upsertChunks($rows,$size,$pause){foreach($rows as $r)self::$rows[$r['chunk_id']]=$r;}
 }
 require __DIR__.'/../lib/CorpusShare.class.php';
+require __DIR__.'/../lib/MilvusStore.class.php';
 require __DIR__.'/../app.php';
-function check($c,$s){if(!$c)throw new RuntimeException($s);echo "PASS $s\n";}
+function check($c,$m){if(!$c)throw new RuntimeException($m);echo "PASS $m\n";}
 try {
- $ref=new ReflectionClass('aiRagPlugin');$app=$ref->newInstanceWithoutConstructor();
- $p=$ref->getProperty('cursorFile');$p->setValue($app,TEMP_PATH.'/cursor.json');
- $method=$ref->getMethod('vectorizeFile');$file=array('fileID'=>42,'name'=>'test.txt','modifyTime'=>1);
- try{$method->invoke($app,$file,$app->getConfig());throw new RuntimeException('pause missing');}catch(AiRagPressureException $e){}
- check(FakeModel::$state['status']===1,'pressure leaves file pending');
- $progress=json_decode(file_get_contents(TEMP_PATH.'/airag-vector-42.json'),true);
- check($progress['written']===50,'checkpoint records only flushed vectors');
- check(count(AiRagMilvusStore::$rows)===50,'partial vectors retained');
- AiRagBackpressure::$pauseAt=0;AiRagEmbedClient::$texts=array();
+ $r=new ReflectionClass('aiRagPlugin');$app=$r->newInstanceWithoutConstructor();$r->getProperty('cursorFile')->setValue($app,TEMP_PATH.'/cursor.json');$method=$r->getMethod('vectorizeFile');
+ $file=array('fileID'=>42,'sourceID'=>5,'parentID'=>6,'ext'=>'txt','name'=>'test.txt','modifyTime'=>1);
+ try{$method->invoke($app,$file,$app->getConfig());throw new RuntimeException('missing pause');}catch(AiRagPressureException $e){}
+ check(count(AiRagHttpJson::$rows)===50&&FakeModel::$state['status']===1,'pause preserves only confirmed writes');
+ AiRagBackpressure::$pause=false;AiRagEmbedClient::$texts=array();
  check($method->invoke($app,$file,$app->getConfig())==='ok','resume completes');
- check(AiRagMilvusStore::$deletes===0,'resume reuses chunk hashes instead of deleting the file');
- check(count(AiRagEmbedClient::$texts)===70 && AiRagEmbedClient::$texts[0]==='chunk50','resume embeds only missing chunks');
- check(count(AiRagMilvusStore::$rows)===120 && FakeModel::$state['status']===2,'all chunks stored before complete status');
- check(!file_exists(TEMP_PATH.'/airag-vector-42.json'),'completed checkpoint cleaned');
- AiRagEmbedClient::$texts=array();
- check($method->invoke($app,$file,$app->getConfig())==='ok','second run is idempotent');
- check(AiRagEmbedClient::$texts===array(),'unchanged chunks skip embedding');
+ check(count(AiRagEmbedClient::$texts)===70,'resume embeds only server-missing chunks');
+ AiRagEmbedClient::$texts=array();$method->invoke($app,$file,$app->getConfig());check(!AiRagEmbedClient::$texts,'unchanged chunks skip embedding');
+ $file['parentID']=99;$file['modifyTime']=2;$method->invoke($app,$file,$app->getConfig());check(!AiRagEmbedClient::$texts&&AiRagHttpJson::$rows['42:0']['parent_id']===99&&AiRagHttpJson::$rows['42:119']['modify_time']===2,'metadata refresh reuses vectors');
+ AiRagEmbedClient::$version='m2';$method->invoke($app,$file,$app->getConfig());check(count(AiRagEmbedClient::$texts)===120,'new embedding model invalidates every old vector');
+ AiRagTextChunker::$changed=true;AiRagEmbedClient::$texts=array();$method->invoke($app,$file,$app->getConfig());check(AiRagEmbedClient::$texts===array('chunk3 updated'),'single changed chunk alone re-embedded');
+ AiRagTextChunker::$count=100;AiRagTextChunker::$changed=false;AiRagHttpJson::$failWrite=true;$deletes=AiRagHttpJson::$deletes;
+ check($method->invoke($app,$file,$app->getConfig())==='fail'&&FakeModel::$state['status']===4,'HTTP 200 business error cannot mark file complete');
+ check(AiRagHttpJson::$deletes===$deletes&&count(AiRagHttpJson::$rows)===120,'failed replacement retains old tail');
+ AiRagHttpJson::$failWrite=false;check($method->invoke($app,$file,$app->getConfig())==='ok'&&count(AiRagHttpJson::$rows)===100,'successful replacement deletes stale tail');
+ AiRagHttpJson::$failRead=true;AiRagEmbedClient::$texts=array();file_put_contents(TEMP_PATH.'/airag-vector-42.json',json_encode(array('written'=>100)));
+ check($method->invoke($app,$file,$app->getConfig())==='fail'&&!AiRagEmbedClient::$texts,'read error never trusts a local checkpoint');
 } finally {foreach(glob(TEMP_PATH.'/*') as $f)unlink($f);rmdir(TEMP_PATH);}

@@ -10,6 +10,8 @@ class AiRagChatClient {
 	public $lastModel = '';
 	public $lastUsage = array();
 	public $lastElapsedMs = 0;
+	public $lastFirstMs = 0;
+	private $requestStartedAt = 0;
 
 	public $lastTrimmed = false;
 	public $lastContext = 0;
@@ -59,6 +61,7 @@ class AiRagChatClient {
 		$thinking = !empty($options['thinking']);
 		$this->lastUsage = array('prompt'=>0,'output'=>0,'total'=>0,'cache'=>0);
 		$this->lastElapsedMs = 0;
+		$this->lastFirstMs = 0;
 		$this->lastReasoning = '';
 		$this->lastModel = $model;
 		$this->lastTrimmed = false;
@@ -67,6 +70,7 @@ class AiRagChatClient {
 		$windows = array($context);
 		$endpoint = $this->url.'/chat/completions';
 		$started = microtime(true);
+		$this->requestStartedAt = $started;
 		$lastError = null;
 		$text = '';
 		$usedMessages = $messages;
@@ -114,6 +118,7 @@ class AiRagChatClient {
 			throw new Exception('LLM '.$endpoint.' model='.$model.' ：上下文超出（按 '.$this->lastContext.' 截断后仍失败）。请把模型卡片里的上下文改成与引擎加载值一致，LM Studio 常见 4096 或 8192。原始错误：'.$lastError->getMessage());
 		}
 		$this->lastElapsedMs = intval((microtime(true) - $started) * 1000);
+		if ($this->lastFirstMs <= 0) $this->lastFirstMs = $this->lastElapsedMs;
 		$this->fillUsage($usedMessages, $text);
 		if ($text === '') throw new Exception('模型没有返回内容');
 		return $text;
@@ -170,6 +175,9 @@ class AiRagChatClient {
 			$piece = (string)_get($delta, 'content', '');
 			$think = (string)_get($delta, 'reasoning_content', _get($delta, 'reasoning', ''));
 			if ($piece === '' && $think === '') return;
+			if ($self->lastFirstMs <= 0 && $self->requestStartedAt > 0) {
+				$self->lastFirstMs = max(1, intval((microtime(true) - $self->requestStartedAt) * 1000));
+			}
 			$text .= $piece;
 			$reason .= $think;
 			if (is_callable($onDelta)) $onDelta($piece, $think);

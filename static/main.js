@@ -138,7 +138,14 @@
 	function openChat(items){
 		items=_.filter(items||[],function(item){return item&&item.path;});
 		var refs=_.map(items,function(item){
-			return {path:item.path,name:item.name||item.path,type:item.type||(item.isFolder?'folder':'file')};
+			return {
+				path:item.path,
+				name:item.name||item.path,
+				type:item.type||(item.isFolder?'folder':'file'),
+				size:Number(item.size||0),
+				ext:item.ext||'',
+				fileThumb:item.fileThumb||item.filethumb||item.thumb||item.fileShowView||''
+			};
 		});
 		try{sessionStorage.setItem('airag.refs',JSON.stringify(refs));}catch(e){}
 		try{localStorage.removeItem('airag.refs');}catch(e){}
@@ -186,7 +193,8 @@
 		var $file=$(this).closest('.file');
 		var path=$file.attr('data-path');
 		if(!path) return;
-		openChat([{path:path,name:$file.attr('data-name')||$.trim($file.find('.filename,.title,.name').first().clone().children().remove().end().text())||path,type:'file'}]);
+		var data=$file.data()||{};
+		openChat([{path:path,name:$file.attr('data-name')||$.trim($file.find('.filename,.title,.name').first().clone().children().remove().end().text())||path,type:'file',size:data.size||0,ext:data.ext||'',fileThumb:data.filethumb||data.fileThumb||data.fileshowview||data.fileShowView||''}]);
 	});
 	function askMenuItem(){
 		return {

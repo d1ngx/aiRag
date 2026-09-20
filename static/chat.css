@@ -1,5 +1,6 @@
 html,body{height:100%;margin:0}
-body.airag-page{background:#fff;color:#1f2329;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+body.airag-page{background:#fff;color:#1f2329;font-family:"Lantinghei SC","Hiragino Sans GB","Microsoft Yahei",Helvetica,Arial,sans-serif}
+body.airag-page button,body.airag-page input,body.airag-page textarea,body.airag-page select{font-family:inherit}
 .airag-app{display:flex;height:100%;min-height:520px;background:#fff}
 .airag-side{width:var(--airag-side-width,248px);flex:0 0 var(--airag-side-width,248px);background:#f7f8fa;display:flex;flex-direction:column}
 .airag-side-resizer{width:5px;flex:0 0 5px;margin-left:-2px;cursor:col-resize;position:relative;z-index:8;background:transparent;touch-action:none}
@@ -33,18 +34,26 @@ body.airag-page{background:#fff;color:#1f2329;font-family:-apple-system,BlinkMac
 .airag-note{margin-top:8px;font-size:12px;color:#8a8f99}
 .airag-caret{display:inline-block;width:7px;height:1em;margin-left:2px;background:#3478f6;vertical-align:-2px;animation:airag-blink .9s steps(1) infinite}
 @keyframes airag-blink{50%{opacity:0}}
-.airag-filecard{display:flex;align-items:center;gap:8px;margin:0 0 8px;background:#fff;border-radius:10px;padding:8px 10px;cursor:pointer}
-.airag-filecard em{width:36px;height:36px;border-radius:8px;background:#e11d48;color:#fff;display:inline-flex;align-items:center;justify-content:center;font-size:10px;font-style:normal;font-weight:700;flex:0 0 36px}
+.airag-filecard{display:flex;align-items:center;gap:10px;margin:0 0 8px;background:#fff;border-radius:10px;padding:8px 10px;cursor:pointer;min-width:260px}
+.airag-filecover{position:relative;display:inline-flex;align-items:center;justify-content:center;overflow:hidden;background:#eef2f7;border-radius:6px;flex:0 0 auto}
+.airag-filecover em{position:absolute;inset:0;background:#e11d48;color:#fff;display:flex;align-items:center;justify-content:center;font-size:9px;font-style:normal;font-weight:700}
+.airag-filecover img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;background:#fff}
+.airag-filecover.is-card{width:42px;height:52px;box-shadow:0 1px 4px rgba(15,23,42,.12)}
+.airag-filecover.is-chip{width:24px;height:30px;border-radius:5px;box-shadow:0 1px 3px rgba(15,23,42,.12)}
+.airag-filecover.is-chip em{font-size:6px}
 .airag-filecard b{display:block;font-size:12px;font-weight:600}
 .airag-filecard small{display:block;color:#8a8f99;font-size:11px;margin-top:2px}
 .airag-barfoot.is-user{justify-content:flex-end;max-width:78%;margin-top:4px}
 .airag-barfoot.is-user .airag-more{left:auto;right:0}
 .airag-msg.bot{padding:0 4px 4px;font-size:13px}
-.airag-think-box{margin:0 0 10px;border:1px solid #ece7ff;border-radius:8px;background:#fbfaff}
-.airag-think-box summary{cursor:pointer;padding:8px 10px;font-size:12px;color:#6b5bb8;list-style:none}
+.airag-think-box{margin:0 0 12px;border:1px solid #e8ebf2;border-radius:10px;background:#fafbfe;contain:content}
+.airag-think-box summary{cursor:pointer;padding:8px 11px;font-size:12px;color:#657086;list-style:none;display:flex;align-items:center;gap:7px;user-select:none}
 .airag-think-box summary::-webkit-details-marker{display:none}
-.airag-think-box[open] summary{border-bottom:1px solid #ece7ff}
-.airag-think{margin:0;padding:8px 10px;background:transparent;border:0;border-radius:0;color:#6b5bb8;font-size:12px;white-space:pre-wrap;max-height:220px;overflow:auto}
+.airag-think-box[open] summary{border-bottom:1px solid #eef0f5}
+.airag-think-box.is-live summary:before{content:"";width:7px;height:7px;border-radius:50%;background:#7c6ee6;box-shadow:0 0 0 4px #eeeaff;animation:airag-think-pulse 1.2s ease-in-out infinite}
+.airag-think{margin:0;padding:9px 11px;background:transparent;border:0;border-radius:0;color:#667085;font-size:12px;line-height:1.65;white-space:pre-wrap;max-height:190px;overflow:auto;overscroll-behavior:contain;scrollbar-width:thin}
+.airag-think-box.is-live[open] .airag-think{height:150px;box-sizing:border-box}
+@keyframes airag-think-pulse{50%{opacity:.45;transform:scale(.82)}}
 .airag-refs-box{margin:10px 0 4px;border:1px solid #eef0f4;border-radius:10px;background:#fafbfd;padding:6px 10px}
 .airag-refs-box summary{cursor:pointer;font-size:12px;color:#4b5563;list-style:none;display:flex;align-items:center;gap:6px}
 .airag-refs-box summary svg{color:#3478f6;flex:0 0 16px}
@@ -69,8 +78,9 @@ body.airag-page{background:#fff;color:#1f2329;font-family:-apple-system,BlinkMac
 .airag-composer-wrap{padding:0 6% 12px}
 .airag-refs{display:flex;flex-wrap:wrap;gap:8px;margin:0 auto 8px;max-width:860px}
 .airag-refs.is-empty{display:none}
-.airag-chip{display:inline-flex;align-items:center;gap:6px;background:#eef4ff;color:#3478f6;border-radius:10px;padding:6px 8px 6px 10px;font-size:12px;max-width:100%;cursor:default;user-select:none}
-.airag-chip em{font-style:normal;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:280px}
+.airag-chip{display:inline-flex;align-items:center;gap:6px;background:#eef4ff;color:#3478f6;border-radius:10px;padding:4px 8px 4px 5px;font-size:12px;max-width:100%;cursor:default;user-select:none}
+.airag-chip>em{font-style:normal;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:280px}
+.airag-folder-cover{width:24px;height:30px;display:inline-flex;align-items:center;justify-content:center;font-style:normal;font-size:16px}
 .airag-chip b{cursor:pointer;font-weight:400;padding:0 4px;border-radius:6px}
 .airag-chip b:hover{background:#dbe7ff}
 .airag-composer{max-width:860px;margin:0 auto;border:1px solid #e6e8eb;border-radius:18px;box-shadow:0 8px 28px rgba(31,35,41,.06);background:#fff;padding:10px 12px 8px}
@@ -129,6 +139,7 @@ body.airag-page{background:#fff;color:#1f2329;font-family:-apple-system,BlinkMac
 .airag-asr-out{white-space:pre-wrap;background:#f7f8fa;border-radius:12px;padding:12px;min-height:80px;font-size:13px}
 .airag-msg-body{white-space:pre-wrap}
 .airag-md{white-space:normal;line-height:1.45}
+.airag-stream-text{white-space:pre-wrap}
 .airag-md p{margin:0 0 .18em}
 .airag-md p:last-child{margin-bottom:0}
 .airag-md h3,.airag-md h4,.airag-md h5{margin:.45em 0 .18em;font-size:14px}
@@ -145,22 +156,32 @@ body.airag-page{background:#fff;color:#1f2329;font-family:-apple-system,BlinkMac
 .airag-calls{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 8px}
 .airag-calls span{display:inline-flex;align-items:center;gap:4px;background:#eefbf2;color:#15803d;border-radius:999px;padding:2px 8px;font-size:12px}
 .airag-calls span.is-fail{background:#fff1f1;color:#dc2626}
-.airag-refs-box{margin:10px 0 4px;border:1px solid #eef0f4;border-radius:10px;background:#fafbfd;padding:6px 10px}
-.airag-refs-box summary{cursor:pointer;font-size:12px;color:#4b5563;list-style:none;display:flex;align-items:center;gap:6px}
+.airag-refs-box{display:block;width:max-content;max-width:100%;margin:8px 0 2px;border:1px solid #edf0f4;border-radius:9px;background:#fbfcfe;padding:3px 7px;box-sizing:border-box}
+.airag-refs-box[open]{width:100%;padding-bottom:7px}
+.airag-refs-box summary{cursor:pointer;font-size:11px;color:#5e6673;list-style:none;display:flex;align-items:center;gap:4px;min-height:26px;white-space:nowrap}
 .airag-refs-box summary em{font-style:normal;color:#8a8f99;font-weight:400}
-.airag-src-list{display:grid;gap:8px;margin-top:8px}
-.airag-src-group{border:1px solid #e7eef8;border-radius:9px;background:#fff;overflow:hidden}
-.airag-src-title{display:flex;align-items:center;gap:6px;padding:7px 9px;background:#f8faff;color:#374151;font-size:12px}
-.airag-src-title svg{color:#3478f6}.airag-src-title b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.airag-src-title em{margin-left:auto;font-style:normal;color:#8a8f99}
-.airag-src-piece{display:flex;width:100%;align-items:flex-start;gap:8px;border:0;border-top:1px solid #f0f3f7;background:#fff;padding:8px 9px;text-align:left;cursor:pointer;color:#4b5563}
-.airag-src-piece:hover{background:#f5f9ff}.airag-src-piece i{min-width:20px;height:20px;border-radius:50%;background:#e8f1ff;color:#3478f6;display:inline-flex;align-items:center;justify-content:center;font-size:10px;font-style:normal}.airag-src-piece span{line-height:1.5;white-space:normal;word-break:break-word}
+.airag-refs-box summary b{min-width:0;height:auto;border-radius:0;background:transparent;font-size:11px;color:#3478f6}
+.airag-src-list{display:grid;gap:6px;margin-top:5px}
+.airag-src-group{border:1px solid #edf1f6;border-radius:7px;background:#fff;overflow:hidden}
+.airag-src-title{display:flex;align-items:center;gap:7px;padding:5px 7px;background:#fafbfe;color:#374151;font-size:11px}
+.airag-src-title svg{color:#3478f6;flex:0 0 14px}
+.airag-src-title b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.airag-src-title em{margin-left:auto;font-style:normal;color:#9aa3b2}
+.airag-src-piece{display:flex;width:100%;align-items:flex-start;gap:6px;border:0;border-top:1px solid #f2f4f7;background:#fff;padding:5px 7px;text-align:left;cursor:pointer;color:#667085;font-size:11px}
+.airag-src-piece:hover{background:#f6f9ff}.airag-src-piece i{min-width:17px;height:17px;border-radius:50%;background:#e8f1ff;color:#3478f6;display:inline-flex;align-items:center;justify-content:center;font-size:9px;font-style:normal}.airag-src-piece span{line-height:1.4;white-space:normal;word-break:break-word;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .airag-src-chip{display:inline-flex;align-items:center;gap:5px;max-width:240px;height:26px;padding:0 8px 0 6px;border:1px solid #e7eef8;border-radius:8px;background:#fff;color:#3478f6;cursor:pointer;font-size:12px;line-height:1}
 .airag-src-chip:hover{background:#f3f8ff;border-color:#d6e4ff}
 .airag-src-chip svg{flex:0 0 14px;color:#3478f6}
 .airag-src-chip i{min-width:16px;height:16px;border-radius:50%;background:#3478f6;color:#fff;display:inline-flex;align-items:center;justify-content:center;font-size:10px;font-style:normal;font-weight:700;flex:0 0 16px}
 .airag-src-chip span{max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#1f2329;font-size:12px}
 .airag-src-chip em{font-style:normal;color:#8a8f99;font-size:11px;flex:0 0 auto}
-.airag-stats{display:inline-flex;gap:10px;margin-left:auto;margin-top:0;color:#9aa3b2;font-size:11px;cursor:help}
+.airag-stats{display:inline-flex;gap:10px;margin-left:auto;margin-top:0;color:#9aa3b2;font-size:11px;cursor:help;position:relative;outline:none}
+.airag-stat-pop{display:none;position:absolute;right:0;bottom:27px;width:max-content;min-width:310px;max-width:min(390px,80vw);padding:8px 11px;border-radius:3px;background:rgba(55,55,55,.92);box-shadow:0 5px 16px rgba(0,0,0,.2);color:#fff;text-align:left;z-index:20;white-space:normal;line-height:1.55;pointer-events:none}
+.airag-stat-pop:after{content:"";position:absolute;right:20px;bottom:-5px;border-width:5px 5px 0;border-style:solid;border-color:rgba(55,55,55,.92) transparent transparent}
+.airag-stat-pop>span{display:flex;gap:4px;align-items:baseline}
+.airag-stat-pop b{font-weight:600;flex:0 0 66px;color:#fff}
+.airag-stat-pop i{font-style:normal;color:#fff;overflow-wrap:anywhere}
+.airag-stat-pop small{font-size:10px;color:#e5e7eb}
+.airag-stats:hover .airag-stat-pop,.airag-stats:focus .airag-stat-pop,.airag-stats:focus-within .airag-stat-pop{display:block}
 .airag-cite-tip{position:fixed;z-index:90;width:280px;max-height:200px;overflow:auto;overscroll-behavior:contain;background:#fff;border-radius:10px;box-shadow:0 12px 32px rgba(15,23,42,.18);padding:10px 12px;font-size:12px;pointer-events:auto}
 .airag-cite-tip b{display:block;margin:0 0 4px}
 .airag-cite-tip span{color:#8a8f99}

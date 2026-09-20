@@ -448,7 +448,7 @@ class aiRagPlugin extends PluginBase {
 		if (!$fileID) return false;
 		$state = Model($this->stateTable)->where(array('fileID' => $fileID))->find();
 		if ($state && _get($state, 'error', '') === '已禁用') return false;
-		if ($state && intval($state['modifyTime']) >= $modifyTime && in_array(intval($state['status']), array(self::ST_ES, self::ST_OK, self::ST_SKIP), true)) return false;
+		if ($state && intval($state['modifyTime']) >= $modifyTime && in_array(intval($state['status']), array(self::ST_ES, self::ST_SKIP), true)) return false;
 		$maxBytes = intval(_get($config, 'maxFileSizeMB', 30)) * 1024 * 1024;
 		if (intval(_get($file, 'size', 0)) <= 0) {
 			$this->saveState($file, self::ST_SKIP, 0, '', '空文件');
@@ -466,6 +466,8 @@ class aiRagPlugin extends PluginBase {
 				return 'wait';
 			}
 			$extracted = AiRagTextNormalizer::clean($doc['content']);
+			$file = $this->attachSourceMeta($file);
+			if ($state && intval($state['status']) === self::ST_OK && (string)_get($state,'contentHash','') === $this->vectorStateHash($extracted, $file, $config, $this->embed($config)->fingerprint())) return false;
 			$origin = 'elasticFulltext';
 			$hash = sha1($extracted);
 			$this->saveState($file, self::ST_ES, 0, $hash, '');
@@ -494,23 +496,21 @@ class aiRagPlugin extends PluginBase {
 			$prefix = _get($config, 'prependName', 1) == '1' ? $name : '';
 			$chunks = AiRagTextChunker::split($text, intval(_get($config, 'chunkSize', 800)), intval(_get($config, 'chunkOverlap', 120)), $prefix);
 			$checkpointPath = rtrim(TEMP_PATH, '/\\').'/airag-vector-'.$fileID.'.json';
-			$fingerprint = sha1($text.json_encode($config).$name.':'.intval(_get($file, 'modifyTime', 0)));
-			$existing = array();
-			try { $existing = $this->milvus()->hashesByFile($fileID); } catch (Throwable $e) { $existing = array(); }
-			$checkpoint = is_file($checkpointPath) ? json_decode(@file_get_contents($checkpointPath), true) : array();
-			$resumeAt = _get($checkpoint, 'fingerprint', '') === $fingerprint ? intval(_get($checkpoint, 'written', 0)) : 0;
-			$resumeAt = max(0, min(count($chunks), $resumeAt));
-			if (!$existing && $resumeAt > 0) {
-				foreach ($chunks as $chunk) {
-					if (intval($chunk['index']) >= $resumeAt) break;
-					$existing[intval($chunk['index'])] = AiRagMilvusStore::chunkHash($chunk['text']);
-				}
+			$embed = $this->embed($config);
+			$model = $embed->fingerprint();
+			$stateHash = $this->vectorStateHash($text, $file, $config, $model);
+			// Server-confirmed rows are the only source of truth for resume.
+			$existing = $this->milvus()->hashesByFile($fileID);
+			$plan = AiRagMilvusStore::diffChunks($chunks, $existing, $model);
+			$refresh = array();
+			foreach ($plan['reuse'] as $index) {
+				$old = (array)$existing[$index];
+				if (intval(_get($old,'source_id',0)) !== intval(_get($file,'sourceID',0)) || intval(_get($old,'parent_id',0)) !== intval(_get($file,'parentID',0)) || intval(_get($old,'modify_time',0)) !== intval(_get($file,'modifyTime',0)) || (string)_get($old,'name','') !== mb_strcut($name,0,512,'UTF-8') || (string)_get($old,'ext','') !== (string)_get($file,'ext','')) $refresh[] = $index;
 			}
-			$plan = AiRagMilvusStore::diffChunks($chunks, $existing);
-			if ($plan['stale']) $this->milvus()->deleteChunks($fileID, $plan['stale']);
+			if ($refresh) $this->milvus()->refreshMetadata($fileID, $refresh, $file);
 			if (!$chunks) {
 				if ($existing) $this->milvus()->deleteFile($fileID);
-				$this->saveState($file, self::ST_OK, 0, sha1($text), '无切片');
+				$this->saveState($file, self::ST_OK, 0, $stateHash, '无切片');
 				@unlink($checkpointPath);
 				return 'ok';
 			}
@@ -522,19 +522,18 @@ class aiRagPlugin extends PluginBase {
 				'fileNo' => $fileNo, 'fileTotal' => $fileTotal, 'chunkDone' => $reused, 'chunkTotal' => $total,
 			));
 			if (!$work) {
-				$this->saveState($file, self::ST_OK, $total, sha1($text), '');
+				if ($plan['stale']) $this->milvus()->deleteChunks($fileID, $plan['stale']);
+				$this->saveState($file, self::ST_OK, $total, $stateHash, '');
 				@unlink($checkpointPath);
 				$this->log('vector '.$this->fileLabel($file).' chunks='.$total.' reuse='.$reused.' embed=0');
 				return 'ok';
 			}
-			$embed = $this->embed();
 			$rows = array();
 			$batchTexts = array();
 			$batchMeta = array();
 			$done = $reused;
-			$written = 0;
 			$self = $this;
-			$flush = function() use (&$rows, &$batchTexts, &$batchMeta, $embed, &$done, $total, $name, $startedAt, $fileNo, $fileTotal, $self, $config, &$written, $checkpointPath, $fingerprint, $reused) {
+			$flush = function() use (&$rows, &$batchTexts, &$batchMeta, $embed, &$done, $total, $name, $startedAt, $fileNo, $fileTotal, $self, $config) {
 				if (!$batchTexts) return;
 				AiRagBackpressure::assertReady($config);
 				$vectors = $embed->embed($batchTexts, 60);
@@ -545,11 +544,9 @@ class aiRagPlugin extends PluginBase {
 				$limit = max(50, min(500, intval(_get($config, 'milvusBatch', 300))));
 				if (count($rows) >= $limit) {
 					$self->milvus()->upsertChunks(array_slice($rows, 0, $limit), $limit, intval(_get($config, 'milvusPauseMs', 700)));
-					$written += $limit;
-					if (file_put_contents($checkpointPath.'.tmp', json_encode(array('fingerprint' => $fingerprint, 'written' => $reused + $written)), LOCK_EX) === false || !rename($checkpointPath.'.tmp', $checkpointPath)) throw new Exception('无法保存向量进度');
 					$rows = array_slice($rows, $limit);
+					$done += $limit;
 				}
-				$done += count($batchTexts);
 				$self->writeCursor($self->readCursor(), array(
 					'running' => 1, 'phase' => 'vector', 'current' => $name, 'started' => $startedAt ?: time(),
 					'fileNo' => $fileNo, 'fileTotal' => $fileTotal, 'chunkDone' => $done, 'chunkTotal' => $total,
@@ -574,7 +571,8 @@ class aiRagPlugin extends PluginBase {
 			}
 			$flush();
 			$this->milvus()->upsertChunks($rows, intval(_get($config, 'milvusBatch', 300)), intval(_get($config, 'milvusPauseMs', 700)));
-			$this->saveState($file, self::ST_OK, $total, sha1($text), '');
+			if ($plan['stale']) $this->milvus()->deleteChunks($fileID, $plan['stale']);
+			$this->saveState($file, self::ST_OK, $total, $stateHash, '');
 			@unlink($checkpointPath);
 			$this->log('vector '.$this->fileLabel($file).' chunks='.$total.' reuse='.$reused.' embed='.($total - $reused).' delete='.count($plan['stale']));
 			return 'ok';
@@ -585,6 +583,13 @@ class aiRagPlugin extends PluginBase {
 			$this->log('vector fail '.$this->fileLabel($file).' '.$e->getMessage(), 'error');
 			return 'fail';
 		}
+	}
+
+	private function vectorStateHash($text, $file, $config, $model) {
+		return sha1($text."\0".$model.json_encode(array(
+			_get($config,'chunkSize',800), _get($config,'chunkOverlap',120), _get($config,'prependName',1),
+			_get($file,'name',''), _get($file,'sourceID',0), _get($file,'parentID',0), _get($file,'modifyTime',0), _get($file,'ext',''),
+		)));
 	}
 
 	private function attachSourceMeta($file, $state = array()) {
@@ -1173,7 +1178,11 @@ class aiRagPlugin extends PluginBase {
 				foreach ($chunks as $chunk) {
 					if (intval(_get($chunk, 'index', -1)) === $chunkWant) { $picked = $chunk; break; }
 				}
-				if (!$picked && isset($chunks[$chunkWant])) $picked = $chunks[$chunkWant];
+				if (!$picked) {
+					$exact = $this->milvus()->listByFile($fileID, 1, $chunkWant);
+					if ($exact) {$picked=$exact[0]; $chunks[]=$picked; usort($chunks,function($a,$b){return $a['index']-$b['index'];});}
+				}
+				if (!$picked) return show_json(array('message'=>'引用分片已不存在，请重新检索该文件'), false);
 			}
 			return show_json(array(
 				'item' => $item,
@@ -1247,7 +1256,7 @@ class aiRagPlugin extends PluginBase {
 			if ($disk) {
 				try {
 					$limit = max(4, min(40, intval(_get($this->getConfig(), 'askLimit', 20))));
-					$search = $this->retriever()->search($question, $limit, !empty(_get($this->getConfig(), 'keywordEnabled', 1)), !empty(_get($this->getConfig(), 'semanticEnabled', 1)), $scope['fileIDs'] ? $scope['fileIDs'] : null);
+					$search = $this->retriever()->search($question, $limit, !empty(_get($this->getConfig(), 'keywordEnabled', 1)), !empty(_get($this->getConfig(), 'semanticEnabled', 1)), $scope['restricted'] ? $scope['fileIDs'] : null);
 					$hits = array_slice((array)$search['hybrid'], 0, 16);
 				} catch (Throwable $e) {
 					$this->log('ask retrieve: '.$e->getMessage(), 'warning');
@@ -1324,16 +1333,38 @@ class aiRagPlugin extends PluginBase {
 					'retrieved' => count($hits),
 				));
 				$self = $this;
+				$pendingStream = array();
+				$pendingBytes = 0;
+				$lastStreamFlush = microtime(true);
+				$streamedAnswer = '';
+				$streamedReasoning = '';
+				$flushStream = function($force = false) use ($self, &$pendingStream, &$pendingBytes, &$lastStreamFlush) {
+					if (!$pendingStream) return;
+					if (!$force && $pendingBytes < 72 && microtime(true) - $lastStreamFlush < 0.024) return;
+					foreach ($pendingStream as $item) $self->sseSend($item[0], array('text' => $item[1]));
+					$pendingStream = array();
+					$pendingBytes = 0;
+					$lastStreamFlush = microtime(true);
+				};
+				$queueStream = function($event, $piece) use (&$pendingStream, &$pendingBytes, &$flushStream) {
+					if ($piece === '') return;
+					$last = count($pendingStream) - 1;
+					if ($last >= 0 && $pendingStream[$last][0] === $event) $pendingStream[$last][1] .= $piece;
+					else $pendingStream[] = array($event, $piece);
+					$pendingBytes += strlen($piece);
+					$flushStream(false);
+				};
 				$answer = $llm->chat($messages, $outCap, $thinking ? 150 : 90, array(
 					'model' => $model,
 					'thinking' => $thinking,
 					'stream' => true,
 					'context' => $ctx,
-					'onDelta' => function($piece, $think) use ($self) {
-						if ($piece !== '') $self->sseSend('delta', array('text' => $piece));
-						if ($think !== '') $self->sseSend('think', array('text' => $think));
+					'onDelta' => function($piece, $think) use ($queueStream, &$streamedAnswer, &$streamedReasoning) {
+						if ($piece !== '') {$streamedAnswer .= $piece; $queueStream('delta', $piece);}
+						if ($think !== '') {$streamedReasoning .= $think; $queueStream('think', $think);}
 					},
 				));
+				$flushStream(true);
 			} else {
 				$answer = $llm->chat($messages, $outCap, $thinking ? 150 : 90, array('model' => $model, 'thinking' => $thinking, 'context' => $ctx));
 			}
@@ -1347,6 +1378,7 @@ class aiRagPlugin extends PluginBase {
 			}
 			$usage = (array)$llm->lastUsage;
 			$elapsedMs = intval($llm->lastElapsedMs);
+			$firstMs = intval($llm->lastFirstMs);
 			$speed = ($elapsedMs > 0 && intval(_get($usage, 'output', 0)) > 0)
 				? round(intval($usage['output']) / ($elapsedMs / 1000), 1)
 				: 0;
@@ -1354,6 +1386,7 @@ class aiRagPlugin extends PluginBase {
 				'tools' => $toolCalls,
 				'usage' => $usage,
 				'elapsedMs' => $elapsedMs,
+				'firstMs' => $firstMs,
 				'speed' => $speed,
 				'provider' => $svcName,
 				'created' => time(),
@@ -1377,11 +1410,20 @@ class aiRagPlugin extends PluginBase {
 				'tools' => $toolCalls,
 				'usage' => $usage,
 				'elapsedMs' => $elapsedMs,
+				'firstMs' => $firstMs,
 				'speed' => $speed,
 				'created' => time(),
 			);
 			if ($wantStream) {
-				$this->sseSend('done', $payload);
+				// Content and reasoning have already arrived as ordered SSE deltas.
+				// Avoid sending tens or hundreds of KB twice at the end of a long reply.
+				$donePayload = $payload;
+				unset($donePayload['answer'], $donePayload['reasoning']);
+				// A provider may fail mid-stream and then succeed through the JSON fallback.
+				// Send the complete field only when it differs from what the browser received.
+				if ($streamedAnswer !== $answer && !($streamedAnswer === '' && $answer === $streamedReasoning)) $donePayload['answer'] = $answer;
+				if ($streamedReasoning !== $llm->lastReasoning) $donePayload['reasoning'] = $llm->lastReasoning;
+				$this->sseSend('done', $donePayload);
 				$this->endSse();
 				return;
 			}
@@ -1467,15 +1509,16 @@ class aiRagPlugin extends PluginBase {
 			$labels[] = (string)_get($info, 'name', $path);
 			if (intval(_get($info, 'isFolder', 0))) {
 				$level = _get($info, 'parentLevel', '').intval(_get($info, 'sourceID', 0)).',';
-				$rows = Model('Source')->where(array(
-					'parentLevel' => array('like', $level.'%'),
-					'isFolder' => 0,
-					'isDelete' => 0,
-				))->field('fileID')->limit(300)->select();
-				foreach ((array)$rows as $row) {
-					$id = intval(_get($row, 'fileID', 0));
-					if ($id) $fileIDs[] = $id;
-				}
+				$after = 0;
+				do {
+					$rows = Model('Source')->where(array('parentLevel'=>array('like',$level.'%'),'isFolder'=>0,'isDelete'=>0,'sourceID'=>array('gt',$after)))->field('fileID,sourceID')->order('sourceID asc')->limit(500)->select();
+					foreach ((array)$rows as $row) {
+						$after = intval($row['sourceID']);
+						$id = intval(_get($row,'fileID',0));
+						if ($id) $fileIDs[] = $id;
+					}
+				} while (count((array)$rows) === 500);
+
 			} else {
 				$id = intval(_get($info, 'fileID', 0));
 				if ($id) $fileIDs[] = $id;
@@ -1483,6 +1526,7 @@ class aiRagPlugin extends PluginBase {
 		}
 		return array(
 			'fileIDs' => array_values(array_unique($fileIDs)),
+			'restricted' => count(array_filter((array)$paths, 'strlen')) > 0,
 			'labels' => array_slice(array_values(array_unique($labels)), 0, 8),
 		);
 	}
@@ -1499,7 +1543,7 @@ class aiRagPlugin extends PluginBase {
 		$append = function($name, $text, $fileID, $chunkNo, $meta) use (&$parts, &$sources, &$used, &$n, &$filled, $budget, $pieceMax) {
 			$text = trim((string)$text);
 			if ($text === '') return;
-			$key = intval($fileID).':'.intval($chunkNo);
+			$key = intval($fileID).':'.($chunkNo === null ? 'es' : intval($chunkNo));
 			if (isset($used[$key])) return;
 			if ($n > 0 && $filled >= $budget) return;
 			$used[$key] = true;
@@ -1512,7 +1556,7 @@ class aiRagPlugin extends PluginBase {
 				'fileID' => intval($fileID),
 				'name' => $name,
 				'snippet' => $piece,
-				'chunk' => intval($chunkNo),
+				'chunk' => $chunkNo === null ? null : intval($chunkNo),
 				'chunks' => intval(_get($meta, 'chunkCount', 0)),
 				'size' => intval(_get($meta, 'size', 0)),
 				'path' => (string)_get($meta, 'path', ''),
@@ -1547,13 +1591,26 @@ class aiRagPlugin extends PluginBase {
 				$append($name, _get($row, 'text', ''), $fileID, _get($row, 'index', 0), $meta);
 			}
 		}
+		$expanded = array();
 		foreach ((array)$hits as $hit) {
+			$matches = (array)_get($hit,'chunks',array());
+			if (!$matches) {$expanded[]=$hit; continue;}
+			foreach ($matches as $match) {
+				$item=$hit;
+				$item['snippet']=(string)_get($match,'text','');
+				$item['chunk']=intval(_get($match,'chunk',0));
+				$item['source']['vector']=$match;
+				$expanded[]=$item;
+			}
+		}
+		foreach ($expanded as $hit) {
 			if ($filled >= $budget) break;
 			$fileID = intval(_get($hit, 'fileID', 0));
 			$chunkText = trim((string)_get($hit, 'snippet', ''));
 			$vec = (array)_get((array)_get($hit, 'source', array()), 'vector', array());
 			if ($chunkText === '') $chunkText = trim((string)_get($vec, 'text', ''));
-			$chunkNo = intval(_get($hit, 'chunk', _get($vec, 'chunk_index', _get($vec, 'chunk', 0))));
+			$chunkNo = $vec ? intval(_get($vec, 'chunk', _get($vec, 'chunk_index', 0))) : null;
+			if ($vec) $chunkText = (string)_get($vec, 'text', '');
 			if ($chunkText === '' && $fileID) {
 				try { $chunkText = mb_substr($this->elastic()->getContent($fileID), 0, 800); } catch (Throwable $e) { $chunkText = ''; }
 			}

@@ -2,6 +2,9 @@
 	var boot=window.AIRAG_BOOT||{};
 	var api=String(boot.api||window.AIRAG_API||'?plugin/aiRag/').replace(/\/?$/,'/');
 	var state={id:'',title:'新对话',messages:[],refs:[],model:'',models:[],thinking:false,tools:{disk:true,web:false,mail:false,save:false},list:[],busy:false,abort:null,waitSec:0,waitTimer:0};
+	var raf=window.requestAnimationFrame||function(fn){return setTimeout(fn,16);};
+	var caf=window.cancelAnimationFrame||clearTimeout;
+	var streamFollowBottom=true,streamScrollRaf=0,streamThinkEl=null;
 	var $ = function(id){return document.getElementById(id);};
 	function esc(s){return String(s||'').replace(/[&<>"']/g,function(c){return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]);});}
 	function fmtNum(n){
@@ -20,7 +23,7 @@
 	function citeBtn(n, src){
 		src=src||{};
 		return '<span class="airag-cite-wrap">'+
-			'<button type="button" class="airag-cite" data-act="cite" data-n="'+n+'" data-file="'+(src.fileID||'')+'" data-chunk="'+(src.chunk||0)+'" data-path="'+esc(src.path||'')+'" title="打开引用 '+n+'">['+n+']</button>'+
+			'<button type="button" class="airag-cite" data-act="cite" data-n="'+n+'" data-file="'+(src.fileID||'')+'" data-chunk="'+(src.chunk==null?-1:src.chunk)+'" data-path="'+esc(src.path||'')+'" title="打开引用 '+n+'">['+n+']</button>'+
 			'</span>';
 	}
 	function mdTable(block){
@@ -201,7 +204,7 @@
 		box.classList.toggle('is-empty', !state.refs.length);
 		box.innerHTML=state.refs.map(function(item,i){
 			return '<span class="airag-chip" data-path="'+esc(item.path||'')+'" title="点击预览">'+
-				(item.type==='folder'?'📁':'📄')+' <em>'+esc(item.name||item.path)+'</em>'+
+				(item.type==='folder'?'<i class="airag-folder-cover">📁</i>':fileCover(item,'is-chip'))+' <em>'+esc(item.name||item.path)+'</em>'+
 				'<b data-i="'+i+'" title="移除">×</b></span>';
 		}).join('');
 	}
@@ -213,6 +216,7 @@
 	}
 	function chunkPos(s){
 		s=s||{};
+		if(s.chunk==null) return '正文摘要';
 		var no=Number(s.chunk);
 		if(!(no>=0)) no=0;
 		var disp=no+1;
@@ -249,17 +253,44 @@
 		var p=function(n){return n<10?'0'+n:String(n);};
 		return p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());
 	}
+	function fmtDate(ts){
+		if(!ts) return '';
+		var d=new Date(Number(ts)*1000);
+		if(isNaN(d.getTime())) return '';
+		var p=function(n){return n<10?'0'+n:String(n);};
+		return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
+	}
+	function statsDetail(msg,u,total,est){
+		var service=(msg.provider?msg.provider+' · ':'')+(msg.model||state.model||'未标记');
+		var usage=(est?'约 ':'')+fmtNum(total)+' <small>(prompt: '+fmtNum(u.prompt||0)+', output: '+fmtNum(u.output||0)+', cache: '+fmtNum(u.cache||0)+')</small>';
+		var rows=[['模型服务',service],['token 用量',usage],['总用时',fmtMs(msg.elapsedMs)]];
+		if(msg.firstMs) rows.push(['首字耗时',fmtMs(msg.firstMs)]);
+		if(msg.speed) rows.push(['生成速度',(est?'约 ':'')+msg.speed+' token/s']);
+		if(msg.created) rows.push(['创建时间',fmtDate(msg.created)]);
+		return '<span class="airag-stat-pop" role="tooltip">'+rows.map(function(row){return '<span><b>'+esc(row[0])+'：</b><i>'+(/^token/.test(row[0])?row[1]:esc(row[1]))+'</i></span>';}).join('')+'</span>';
+	}
 	function icoBtn(act,title,path,on){
 		return '<button type="button" class="airag-ibtn'+(on?' is-on':'')+'" data-act="'+act+'" title="'+title+'"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'+path+'</svg></button>';
+	}
+	function fileCover(item, extra){
+		item=item||{};
+		var name=item.name||item.path||'文件';
+		var ext=(String(name).split('.').pop()||'FILE').toUpperCase();
+		if(ext.length>5) ext='FILE';
+		var thumb=item.fileThumb||item.filethumb||item.thumb||item.cover||'';
+		if(!thumb && item.path){
+			var base=String(location.href||'').split('#')[0].split('?')[0];
+			thumb=base+'?plugin/fileThumb/cover&width=240&path='+encodeURIComponent(item.path)+'&name='+encodeURIComponent('/'+name);
+		}
+		return '<span class="airag-filecover'+(extra?' '+extra:'')+'"><em>'+esc(ext)+'</em>'+
+			(thumb?'<img src="'+esc(thumb)+'" alt="" loading="lazy" onerror="this.style.display=\'none\'">':'')+'</span>';
 	}
 	function fileCard(item){
 		if(!item) return '';
 		var name=item.name||item.path||'文件';
-		var ext=(String(name).split('.').pop()||'FILE').toUpperCase();
-		if(ext.length>5) ext='FILE';
 		var meta=[];
 		if(item.size) meta.push(sizeText(item.size));
-		return '<div class="airag-filecard" data-act="preview" data-path="'+esc(item.path||'')+'" data-name="'+esc(item.name||'')+'" title="点击预览"><em>'+esc(ext)+'</em><div><b>'+esc(name)+'</b>'+(meta.length?'<small>'+esc(meta.join(' · '))+'</small>':'')+'</div></div>';
+		return '<div class="airag-filecard" data-act="preview" data-path="'+esc(item.path||'')+'" data-name="'+esc(item.name||'')+'" title="点击预览">'+fileCover(item,'is-card')+'<div><b>'+esc(name)+'</b>'+(meta.length?'<small>'+esc(meta.join(' · '))+'</small>':'')+'</div></div>';
 	}
 	function userActs(){
 		return '<div class="airag-barfoot is-user"><div class="airag-acts">'+
@@ -302,16 +333,19 @@
 						return '<span class="'+(t.ok===false?'is-fail':'is-ok')+'" title="篇=命中文档数，片=喂给模型的分片数">'+esc(toolLabel(t))+'</span>';
 					}).join('')+'</div>';
 				}
-				if(msg.reasoning) html+='<details class="airag-think-box"'+(msg.streaming?' open':'')+'><summary>深度思考</summary><div class="airag-think">'+esc(msg.reasoning)+'</div></details>';
-				html+='<div class="airag-msg-body airag-md">'+md(msg.content||'', msg.streaming?[]:(msg.sources||[]))+(msg.streaming?'<i class="airag-caret"></i>':'')+'</div>';
+				if(msg.reasoning){
+					var thinkLive=msg.streaming&&!msg.answerStarted;
+					html+='<details class="airag-think-box'+(thinkLive?' is-live':'')+'"'+(thinkLive?' open':'')+'><summary>'+(thinkLive?'正在深度思考':'思考过程')+'</summary><div class="airag-think">'+esc(msg.reasoning)+'</div></details>';
+				}
+				html+='<div class="airag-msg-body airag-md">'+(msg.streaming?'<span class="airag-stream-text">'+esc(msg.content||'')+'</span><i class="airag-caret"></i>':md(msg.content||'',msg.sources||[]))+'</div>';
 				if(!msg.streaming && msg.sources&&msg.sources.length){
 					var groups=groupSources(msg.sources);
-					html+='<details class="airag-refs-box"><summary>'+fileIco()+' 引用资料 <b>'+groups.length+' 篇</b></summary><div class="airag-src-list">';
+					html+='<details class="airag-refs-box"><summary>'+fileIco()+'<span>引用资料</span><b>'+groups.length+'</b><em>篇</em></summary><div class="airag-src-list">';
 					html+=groups.map(function(g){
-						return '<section class="airag-src-group"><div class="airag-src-title">'+fileIco()+'<b>'+esc(g.name||'资料')+'</b></div>'+
+						return '<section class="airag-src-group"><div class="airag-src-title">'+fileIco()+'<b>'+esc(g.name||'资料')+'</b><em>'+g.items.length+' 片</em></div>'+
 							g.items.map(function(src){
 								var n=src.index||1;
-								return '<button type="button" class="airag-src-piece" data-act="cite" data-n="'+n+'" data-file="'+(g.fileID||'')+'" data-chunk="'+(src.chunk||0)+'" data-path="'+esc(g.path||'')+'">'+
+								return '<button type="button" class="airag-src-piece" data-act="cite" data-n="'+n+'" data-file="'+(g.fileID||'')+'" data-chunk="'+(src.chunk==null?-1:src.chunk)+'" data-path="'+esc(g.path||'')+'">'+
 									'<i>'+n+'</i><span>'+esc(src.snippet||'该分片暂无摘要，点击查看正文')+'</span></button>';
 							}).join('')+'</section>';
 					}).join('');
@@ -322,10 +356,6 @@
 				var u=msg.usage||{};
 				var total=u.total||((u.prompt||0)+(u.output||0));
 				var est=!!u.est;
-				var tip='模型服务：'+(msg.provider?msg.provider+' / ':'')+(msg.model||state.model||'')+
-					'\ntoken用量：'+(est?'约 ':'')+total+' (prompt:'+(u.prompt||0)+', output:'+(u.output||0)+', cache:'+(u.cache||0)+')'+(est?'\n接口未返回用量，已按文本估算':'')+
-					'\n总用时：'+fmtMs(msg.elapsedMs)+
-					(msg.speed?'\n生成速度：'+(est?'约 ':'')+msg.speed+' token/s':'');
 				html+='<div class="airag-barfoot">';
 				html+='<div class="airag-acts">'+
 					icoBtn('copy','复制','<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>')+
@@ -336,7 +366,7 @@
 					'</div>';
 				html+='<div class="airag-more"><button type="button" data-act="star">收藏</button><button type="button" data-act="share">分享</button><button type="button" data-act="copy">复制</button><button type="button" data-act="export">导出</button><button type="button" data-act="retry">重新生成</button></div>';
 				if(total || msg.elapsedMs){
-					html+='<div class="airag-stats" title="'+esc(tip)+'">'+(fmtClock(msg.created)?'<span>'+fmtClock(msg.created)+'</span>':'')+'<span>token: '+(est?'约 ':'')+fmtNum(total)+'</span><span>'+fmtMs(msg.elapsedMs)+'</span></div>';
+					html+='<div class="airag-stats" tabindex="0">'+(fmtClock(msg.created)?'<span>'+fmtClock(msg.created)+'</span>':'')+'<span>token: '+(est?'约 ':'')+fmtNum(total)+'</span><span>'+fmtMs(msg.elapsedMs)+'</span>'+statsDetail(msg,u,total,est)+'</div>';
 				}
 				html+='</div>';
 				}
@@ -424,7 +454,14 @@
 	}
 	function addRef(info){
 		if(!info) return;
-		var item={path:info.path||info,name:info.name||info.pathDisplay||info.path,type:info.type||(info.isFolder?'folder':'file')};
+		var item={
+			path:info.path||info,
+			name:info.name||info.pathDisplay||info.path,
+			type:info.type||(info.isFolder?'folder':'file'),
+			size:Number(info.size||0),
+			ext:info.ext||'',
+			fileThumb:info.fileThumb||info.filethumb||info.thumb||info.fileShowView||''
+		};
 		if(!item.path) return;
 		if(state.refs.some(function(r){return r.path===item.path;})) return;
 		state.refs.push(item);
@@ -484,6 +521,17 @@
 		}
 		return null;
 	}
+	function scheduleStreamFollow(thinkEl){
+		if(thinkEl && thinkEl._airagFollow!==false) streamThinkEl=thinkEl;
+		if(streamScrollRaf) return;
+		streamScrollRaf=raf(function(){
+			streamScrollRaf=0;
+			var box=$('airag-log');
+			if(streamFollowBottom&&box) box.scrollTop=2147483647;
+			if(streamThinkEl&&streamThinkEl.isConnected&&streamThinkEl._airagFollow!==false) streamThinkEl.scrollTop=2147483647;
+			streamThinkEl=null;
+		});
+	}
 	function patchStream(){
 		var msg=lastBot();
 		if(!msg) return;
@@ -493,38 +541,71 @@
 		var thinkEl=wrap.querySelector('.airag-think');
 		if(msg.reasoning){
 			if(!thinkEl){
-				var box=document.createElement('details');
-				box.className='airag-think-box';
-				box.open=true;
-				box.innerHTML='<summary>深度思考</summary><div class="airag-think"></div>';
-				wrap.insertBefore(box, wrap.querySelector('.airag-md')||wrap.firstChild);
-				thinkEl=box.querySelector('.airag-think');
+				var thinkBox=document.createElement('details');
+				thinkBox.className='airag-think-box is-live';
+				thinkBox.open=!msg.answerStarted;
+				thinkBox.innerHTML='<summary>'+(msg.answerStarted?'思考过程':'正在深度思考')+'</summary><div class="airag-think"></div>';
+				wrap.insertBefore(thinkBox, wrap.querySelector('.airag-md')||wrap.firstChild);
+				thinkEl=thinkBox.querySelector('.airag-think');
 			}
-			thinkEl.textContent=msg.reasoning;
+			if(!thinkEl._airagFollowBound){
+				thinkEl._airagFollowBound=true;thinkEl._airagFollow=true;
+				thinkEl.addEventListener('wheel',function(){this._airagFollow=false;},{passive:true});
+				thinkEl.addEventListener('touchstart',function(){this._airagFollow=false;},{passive:true});
+			}
+			var details=thinkEl.closest('details');
+			var shown=thinkEl._airagText||thinkEl.textContent||'';
+			var thinkNode=thinkEl.firstChild;
+			if(msg.reasoning.length>=shown.length && thinkNode && thinkNode.nodeType===3 && thinkEl.childNodes.length===1) thinkNode.appendData(msg.reasoning.slice(shown.length));
+			else thinkEl.textContent=msg.reasoning;
+			thinkEl._airagText=msg.reasoning;
+			if(details){
+				details.classList.toggle('is-live',!msg.answerStarted);
+				var summary=details.querySelector('summary');
+				if(summary) summary.textContent=msg.answerStarted?'思考过程':'正在深度思考';
+				if(msg.answerStarted&&!msg.thinkCollapsed){details.open=false;msg.thinkCollapsed=true;}
+			}
 		}
-		if(mdEl) mdEl.innerHTML=md(msg.content||'', msg.sources||[])+(msg.streaming?'<i class="airag-caret"></i>':'');
-		var box=$('airag-log');
-		if(box && box.scrollHeight-box.scrollTop-box.clientHeight<120) box.scrollTop=box.scrollHeight;
+		var raw=msg.content||'';
+		if(mdEl&&mdEl._airagRaw!==raw){
+			var streamText=mdEl.querySelector('.airag-stream-text');
+			if(!streamText){
+				mdEl.innerHTML='<span class="airag-stream-text"></span><i class="airag-caret"></i>';
+				streamText=mdEl.querySelector('.airag-stream-text');
+			}
+			var shown=streamText._airagText||streamText.textContent||'';
+			var answerNode=streamText.firstChild;
+			if(raw.length>=shown.length && answerNode && answerNode.nodeType===3 && streamText.childNodes.length===1) answerNode.appendData(raw.slice(shown.length));
+			else streamText.textContent=raw;
+			streamText._airagText=raw;
+			mdEl._airagRaw=raw;
+		}
+		scheduleStreamFollow(thinkEl);
 	}
-	var typeQ='', typeTimer=0;
-	function typeFlush(){
-		var msg=lastBot();
-		if(!msg||!msg.streaming){ typeQ=''; if(typeTimer){clearInterval(typeTimer);typeTimer=0;} return; }
-		if(!typeQ){ if(typeTimer){clearInterval(typeTimer);typeTimer=0;} return; }
-		var n=typeQ.length>24?Math.ceil(typeQ.length/8):1;
-		msg.content=(msg.content||'')+typeQ.slice(0,n);
-		typeQ=typeQ.slice(n);
-		patchStream();
+	var streamRenderRaf=0;
+	function scheduleStreamPatch(force){
+		if(force){
+			if(streamRenderRaf){caf(streamRenderRaf);streamRenderRaf=0;}
+			patchStream();return;
+		}
+		if(streamRenderRaf) return;
+		streamRenderRaf=raf(function(){streamRenderRaf=0;patchStream();});
 	}
 	function typePush(s){
 		if(!s) return;
-		typeQ+=s;
-		if(!typeTimer) typeTimer=setInterval(typeFlush, 18);
+		var msg=lastBot();
+		if(!msg) return;
+		if(!msg.streaming){
+			msg.loading=false;msg.streaming=true;
+			if(msg.content==='正在检索资料…') msg.content='';
+			renderLog();
+		}
+		if(!msg.answerStarted){msg.answerStarted=Date.now();msg.thinkCollapsed=false;}
+		msg.content=(msg.content||'')+s;
+		scheduleStreamPatch(false);
 	}
 	function typeDrain(){
-		var msg=lastBot();
-		if(msg&&typeQ){ msg.content=(msg.content||'')+typeQ; typeQ=''; }
-		if(typeTimer){clearInterval(typeTimer);typeTimer=0;}
+		scheduleStreamPatch(true);
 	}
 	function parseSseBlock(block, onEvent){
 		var ev='message', data=[];
@@ -564,12 +645,9 @@
 		var msg=lastBot()||{};
 		var streamed=String(msg.content||'');
 		var incoming=data&&data.answer!=null?String(data.answer):'';
-		var answer=incoming;
-		if(streamed && incoming){
-			if(incoming===streamed || incoming.indexOf(streamed)===0) answer=incoming;
-			else if(streamed.indexOf(incoming)===0) answer=streamed;
-			else answer=incoming.length>streamed.length?incoming:streamed; // 流式中断回退取更完整的一份
-		}else if(!answer) answer=streamed||fallback||'';
+		// `done.answer` is sent only when the server had to repair or normalize
+		// the streamed text, so it is authoritative even when it is shorter.
+		var answer=incoming||streamed||fallback||msg.reasoning||'';
 		replaceLoading({
 			role:'bot',
 			content:answer,
@@ -582,6 +660,7 @@
 			tools:(data&&data.tools)||msg.tools||[],
 			usage:(data&&data.usage)||{},
 			elapsedMs:(data&&data.elapsedMs)||0,
+			firstMs:(data&&data.firstMs)||msg.firstMs||0,
 			speed:(data&&data.speed)||0,
 			model:(data&&data.model)||state.model,
 			provider:(data&&data.provider)||'',
@@ -596,6 +675,8 @@
 		var q=(text!=null?text:(input.value||'')).trim();
 		if(!q||state.busy) return;
 		if(!state.model){ chatToast('没有可用的对话模型（检测未通过的已排除）'); return; }
+		hideCiteTip(0);
+		streamFollowBottom=true;
 		if(text==null) input.value='';
 		state.messages.push({role:'user',content:q,refs:state.refs.slice()});
 		state.messages.push({role:'bot',content:'正在检索资料…',loading:true,streaming:false});
@@ -656,7 +737,7 @@
 					if(ev==='think'){
 						msg.reasoning=(msg.reasoning||'')+(data.text||'');
 						if(!msg.streaming){ msg.loading=false; msg.streaming=true; if(msg.content==='正在检索资料…') msg.content=''; renderLog(); }
-						else patchStream();
+						else scheduleStreamPatch(false);
 					}
 					if(ev==='done'){ finished=true; finishBot(data); }
 					if(ev==='error') streamFail=new Error(data.message||'提问失败');
@@ -676,11 +757,8 @@
 				var bot=lastBot();
 				if(bot){ bot.loading=false; bot.streaming=true; bot.content=''; bot.sources=data.sources||[]; bot.tools=data.tools||[]; renderLog(); }
 				typePush(data.answer||'');
-				return new Promise(function(resolve){
-					var wait=setInterval(function(){
-						if(!typeQ){ clearInterval(wait); finishBot(data); resolve(); }
-					}, 40);
-				});
+				finishBot(data);
+				return data;
 			});
 		}).catch(function(err){
 			typeDrain();
@@ -800,7 +878,7 @@
 			||all[Number(n)-1]||{};
 		var same=fileID?all.filter(function(s){return String(s.fileID||'')===String(fileID);}):[src];
 		if(!same.length) same=[src];
-		var nos=same.map(function(s){ return Number(s.chunk)>=0?Number(s.chunk)+1:Number(s.index||1); }).filter(Boolean);
+		var nos=same.map(function(s){ return s.chunk!=null&&Number(s.chunk)>=0?Number(s.chunk)+1:Number(s.index||1); }).filter(Boolean);
 		var meta=sizeText(src.size||same[0]&&same[0].size)+' · '+(same.length>1?('引用 '+same.length+' 片（'+nos.join('、')+'）'):('分片 '+chunkPos(src)));
 		var tip=document.createElement('div');
 		tip.id='airag-cite-tip';
@@ -813,7 +891,7 @@
 		tip.style.left=Math.max(8, Math.min(r.left, window.innerWidth-320))+'px';
 		// 引用一般在回答末尾，下方常常没有空间，不够就翻到上面显示
 		var h=tip.offsetHeight||200;
-		tip.style.top=(r.bottom-8+h>window.innerHeight-8 ? Math.max(8, r.top-h+8) : r.bottom-8)+'px';
+		tip.style.top=(r.bottom+6+h>window.innerHeight-8 ? Math.max(8, r.top-h-6) : r.bottom+6)+'px';
 		tip.addEventListener('mouseenter',function(){ clearTimeout(citeTipTimer); });
 		tip.addEventListener('mouseleave',function(){ hideCiteTip(480); });
 		tip.addEventListener('wheel',function(e){
@@ -842,6 +920,12 @@
 	function openCite(btn){
 		var fileID=btn.getAttribute('data-file');
 		var chunk=Number(btn.getAttribute('data-chunk')||0);
+		if(chunk<0){
+			var msg=btn.closest('.airag-msg');
+			var sources=(state.messages[msg?Number(msg.getAttribute('data-i')):-1]||{}).sources||[];
+			var source=sources.filter(function(s){return String(s.index)===String(btn.getAttribute('data-n'));})[0];
+			if(source){showSourceDlg({name:source.name,size:source.size,summary:true},[{index:null,text:source.snippet}],0,source.path||'');return;}
+		}
 		var path=btn.getAttribute('data-path')||'';
 		hideCiteTip(0);
 		if(!fileID){
@@ -849,6 +933,7 @@
 			return;
 		}
 		post('chat',{operation:'source',fileID:fileID,chunk:chunk}).then(function(res){
+			if(!res||res.code===false) throw new Error('引用分片不可用');
 			var data=res&&res.data||{};
 			var item=data.item||{};
 			var chunks=data.chunks||item.chunks||[];
@@ -885,7 +970,7 @@
 			var c=chunks[idx]||{};
 			var tot=item.chunkCount||chunks.length||(idx+1);
 			if(tot<chunks.length) tot=chunks.length;
-			mask.querySelector('.meta').textContent=sizeText(item.size)+' · 分片 '+(idx+1)+' / '+tot;
+			mask.querySelector('.meta').textContent=sizeText(item.size)+(item.summary?' · 正文摘要':' · 分片 '+(Number(c.index)+1)+' / '+tot);
 			mask.querySelector('pre').textContent=(c.text!=null&&c.text!=='')?c.text:(idx===0?(item.content||''):'（该分片无文本）');
 			mask.querySelector('pre').scrollTop=0;
 			mask.querySelector('[data-prev]').disabled=idx<=0;
@@ -1144,7 +1229,8 @@
 	});
 	$('airag-latest').onclick=function(){$('airag-log').scrollTop=$('airag-log').scrollHeight;};
 	$('airag-log').addEventListener('scroll',function(){
-		$('airag-latest').hidden=this.scrollHeight-this.scrollTop-this.clientHeight<120;
+		streamFollowBottom=this.scrollHeight-this.scrollTop-this.clientHeight<160;
+		$('airag-latest').hidden=streamFollowBottom;
 	});
 	document.querySelectorAll('[data-prompt]').forEach(function(button){button.onclick=function(){
 		$('airag-input').value=this.getAttribute('data-prompt'); $('airag-input').focus();

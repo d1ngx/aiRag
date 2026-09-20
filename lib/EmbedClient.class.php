@@ -38,6 +38,10 @@ class AiRagEmbedClient {
 		return isset($alias[$key]) ? $alias[$key] : $model;
 	}
 
+	public function fingerprint() {
+		return sha1(json_encode(array($this->url, $this->model, $this->dim, 'embedding-v1')));
+	}
+
 	public function ping() {
 		if ($this->url === '') return array('mode' => 'local-hash', 'dim' => $this->dim);
 		$sample = $this->embed(array('ping'), 8);
@@ -65,6 +69,10 @@ class AiRagEmbedClient {
 		$vectors = array();
 		foreach ((array)$data as $item) {
 			$vectors[] = array_map('floatval', (array)_get($item, 'embedding', array()));
+		}
+		foreach ($vectors as $vector) {
+			if (count($vector) !== $this->dim) throw new Exception('Embedding 维度与配置不一致，请确认模型及集合维度');
+			foreach ($vector as $value) if (!is_finite($value)) throw new Exception('Embedding 返回非有限数值');
 		}
 		if (count($vectors) !== count($texts)) throw new Exception('Embedding count mismatch');
 		return $vectors;

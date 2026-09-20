@@ -127,6 +127,7 @@ class AiRagElasticStore {
 			),
 		);
 		$clauses = array();
+		if ($fileIDs !== null && !array_filter(array_map('intval',(array)$fileIDs))) return array();
 		$fileIDs = array_values(array_filter(array_map('intval', (array)$fileIDs)));
 		if ($fileIDs) $clauses[] = array('terms' => array('fileID' => $fileIDs));
 		$filter = is_array($filter) ? $filter : array();
@@ -134,6 +135,9 @@ class AiRagElasticStore {
 		if ($source) $clauses[] = array('term' => array('sourceID' => $source));
 		$ext = strtolower(preg_replace('/[^a-z0-9]+/', '', (string)_get($filter, 'ext', '')));
 		if ($ext !== '') $clauses[] = array('term' => array('ext' => $ext));
+		$since = intval(_get($filter,'modifyTime',0));
+		if ($since) $clauses[] = array('range'=>array('modifyTime'=>array('gte'=>(string)$since,'format'=>'epoch_second')));
+		if (intval(_get($filter,'parentID',0))) throw new RuntimeException('目录过滤必须由混合检索入口解析');
 		if ($clauses) $body['query']['bool']['filter'] = $clauses;
 		$response = AiRagHttpJson::request('POST', $this->url.'/'.$this->index.'/_search', $body, array(), 12);
 		$result = array();
