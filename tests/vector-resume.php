@@ -8,7 +8,7 @@ class FakeModel {static $state=array('status'=>1);function where($a){return $thi
 function Model($name){return new FakeModel;}
 class AiRagPressureException extends RuntimeException {}
 class AiRagBackpressure {static $pause=true;static function assertReady($c){if(self::$pause&&count(AiRagHttpJson::$rows)>=50)throw new AiRagPressureException('test');}}
-class AiRagElasticStore {function __construct($c){}function getDocument($id){return array('content'=>'正文','modifyTime'=>999);}}
+class AiRagElasticStore {function __construct($c){}function getDocument($id){return array('content'=>'正文','modifyTime'=>999,'extractVersion'=>'attachment-v2-1000000');}}
 class AiRagTextNormalizer {static function clean($s){return $s;}}
 class AiRagTextChunker {static $count=120;static $changed=false;static function split($t,$s,$o,$p){$r=array();for($i=0;$i<self::$count;$i++)$r[]=array('index'=>$i,'text'=>'chunk'.$i.(self::$changed&&$i===3?' updated':''));return $r;}}
 class AiRagEmbedClient {static $texts=array();static $version='m1';function __construct($c){}function fingerprint(){return self::$version;}function embed($texts,$timeout){self::$texts=array_merge(self::$texts,$texts);return array_fill(0,count($texts),array_fill(0,32,0.1));}}

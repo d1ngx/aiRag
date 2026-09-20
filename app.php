@@ -461,7 +461,7 @@ class aiRagPlugin extends PluginBase {
 		}
 		try {
 			$doc = $this->elastic($config)->getDocument($fileID);
-			if (!KodboxCorpusShare::isFresh($doc, $modifyTime)) {
+			if (!KodboxCorpusShare::isFresh($doc, $modifyTime, KodboxCorpusShare::extractVersion())) {
 				$this->saveState($file, self::ST_WAIT, 0, '', '等待 elasticFulltext 提取最新正文');
 				return 'wait';
 			}
@@ -486,7 +486,7 @@ class aiRagPlugin extends PluginBase {
 		$name = (string)_get($file, 'name', '');
 		try {
 			$doc = $this->elastic($config)->getDocument($fileID);
-			if (!KodboxCorpusShare::isFresh($doc, intval(_get($file, 'modifyTime', 0)))) {
+			if (!KodboxCorpusShare::isFresh($doc, intval(_get($file, 'modifyTime', 0)), KodboxCorpusShare::extractVersion())) {
 				$this->saveState($file, self::ST_WAIT, 0, '', '等待 elasticFulltext 提取最新正文');
 				return 'wait';
 			}

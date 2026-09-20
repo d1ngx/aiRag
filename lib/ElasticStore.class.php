@@ -83,13 +83,14 @@ class AiRagElasticStore {
 	}
 
 	public function getDocument($fileID) {
-		$result = AiRagHttpJson::request('GET', $this->url.'/'.$this->index.'/_source/'.intval($fileID).'?_source_includes=content,modifyTime,name,size', null, array(), 8, array(200, 404));
+		$result = AiRagHttpJson::request('GET', $this->url.'/'.$this->index.'/_source/'.intval($fileID).'?_source_includes=content,modifyTime,name,size,extractVersion', null, array(), 8, array(200, 404));
 		if (intval($result['_status']) === 404) return array();
 		return array(
 			'content' => (string)_get($result, 'content', ''),
 			'modifyTime' => intval(_get($result, 'modifyTime', 0)),
 			'name' => (string)_get($result, 'name', ''),
 			'size' => intval(_get($result, 'size', 0)),
+			'extractVersion' => (string)_get($result, 'extractVersion', ''),
 		);
 	}
 

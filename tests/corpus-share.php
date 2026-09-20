@@ -10,6 +10,8 @@ check(!KodboxCorpusShare::isFresh(array('content' => '合同', 'modifyTime' => 0
 check(KodboxCorpusShare::isFresh(array('content' => '合同', 'modifyTime' => 0), 0), 'undated legacy docs remain reusable for undated files');
 check(!KodboxCorpusShare::isFresh(array('content' => '  ', 'modifyTime' => 100), 100), 'blank content is not reusable');
 check(!KodboxCorpusShare::isFresh(array(), 100), 'missing document is not reusable');
+check(KodboxCorpusShare::isFresh(array('content'=>'正文','modifyTime'=>100,'extractVersion'=>'attachment-v2-1000000'),100,'attachment-v2-1000000'),'matching extraction version is reusable');
+check(!KodboxCorpusShare::isFresh(array('content'=>'正文','modifyTime'=>100,'extractVersion'=>'attachment-v2-200000'),100,'attachment-v2-1000000'),'old extraction version is not reusable');
 $opts = KodboxCorpusShare::storeOptions('missingPlugin', 'http://elasticsearch:9200', 'kodbox-fulltext');
 check($opts['indexName'] === 'kodbox-fulltext' && $opts['elasticUrl'] === 'http://elasticsearch:9200', 'fallback store options');
 echo "OK\n";
