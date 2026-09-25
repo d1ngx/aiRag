@@ -26,6 +26,16 @@ class aiRagPlugin extends PluginBase {
 	}
 
 	public function bindHooks() {
+		$this->bindSearchHooks();
+		Hook::bind('explorer.list.path.before', 'aiRagPlugin.bindSearchHooks');
+	}
+
+	public function bindSearchHooks() {
+		Hook::unbind('explorer.listSearch.searchDataBefore', 'aiRagPlugin.searchBefore');
+		Hook::unbind('explorer.listSearch.searchDataAfter', 'aiRagPlugin.searchAfter');
+		Hook::unbind('explorer.listSearch.fileContentText', 'aiRagPlugin.fileContentText');
+		Hook::unbind('docSearch.fileContentMatch', 'aiRagPlugin.docSearchMatch');
+		Hook::unbind('explorer.list.path.parse', 'aiRagPlugin.listPathParse');
 		Hook::bind('explorer.listSearch.searchDataBefore', 'aiRagPlugin.searchBefore');
 		Hook::bind('explorer.listSearch.searchDataAfter', 'aiRagPlugin.searchAfter');
 		Hook::bind('explorer.listSearch.fileContentText', 'aiRagPlugin.fileContentText');
@@ -48,7 +58,7 @@ class aiRagPlugin extends PluginBase {
 			'models' => AiRagModelHub::chatModels($this->services()),
 			'model' => (string)_get($this->getConfig(), 'llmModel', ''),
 			'imageModels' => $this->typedModels($this->services(), 'image', true),
-			'asrModels' => $this->typedModels($this->services(), 'asr', true),
+			'staticPath' => defined('STATIC_PATH') ? STATIC_PATH : ((defined('APP_HOST') ? APP_HOST : '').'static/'),
 		);
 		include $this->pluginPath.'static/page.html';
 	}
@@ -176,16 +186,24 @@ class aiRagPlugin extends PluginBase {
 	}
 
 	public function docSearchMatch($param) {
-		if (!$this->isOpen() || !_get($this->getConfig(), 'hybridEnabled', 1)) return $param;
 		return $this->searchBefore($param);
 	}
 
 	public function searchBefore($param) {
-		if (!$this->isOpen() || !_get($this->getConfig(), 'hybridEnabled', 1)) return $param;
-		if (!is_array($param) || empty($param['words']) || !in_array('content', (array)_get($param, 'option', array()), true)) return $param;
-		if (strlen($param['words']) <= 1 || empty($param['parentID'])) return $param;
+		if (!$this->isOpen() || !_get($this->getConfig(), 'hybridEnabled', 1)) return;
+		// 网盘「文件内容」关键词检索由 elasticFulltext 负责；未开语义时不要再打 Embedding。
+		if (!_get($this->getConfig(), 'semanticEnabled', 1)) return;
+		if (!is_array($param) || empty($param['words']) || !in_array('content', (array)_get($param, 'option', array()), true)) return;
+		if (strlen($param['words']) <= 1 || empty($param['parentID'])) return;
+		$level = ob_get_level();
+		ob_start();
 		try {
-			$result = $this->retriever()->search($param['words'], intval(_get($this->getConfig(), 'searchLimit', 80)));
+			$result = $this->retriever()->search(
+				$param['words'],
+				intval(_get($this->getConfig(), 'searchLimit', 80)),
+				!empty(_get($this->getConfig(), 'keywordEnabled', 1)),
+				true
+			);
 			$fileIDs = array();
 			$this->snippets = array();
 			$this->matchedFileIDs = array();
@@ -196,34 +214,28 @@ class aiRagPlugin extends PluginBase {
 				$this->matchedFileIDs[$fileID] = true;
 				if (!empty($hit['snippet'])) $this->snippets[$fileID] = $this->sanitizeSnippet($hit['snippet']);
 			}
-			$param['fileID'] = $fileIDs ? array_values(array_unique($fileIDs)) : array(-1);
-			$param['_aiRag'] = 1;
+			$param = KodboxCorpusShare::takeContentHits($param, $fileIDs, $this->snippets, 'aiRag');
 		} catch (Throwable $e) {
 			$this->log('search failed: '.$e->getMessage(), 'error');
+			while (ob_get_level() > $level) @ob_end_clean();
+			return;
 		}
+		while (ob_get_level() > $level) @ob_end_clean();
 		return $param;
 	}
 
 	public function searchAfter($param, $listData) {
-		if (empty($param['_aiRag']) || !is_array($listData) || !isset($listData['fileList'])) return $listData;
-		$filtered = array();
-		foreach ($listData['fileList'] as $item) {
-			$fileID = intval(_get($item, 'fileID', 0));
-			if (!$fileID || !isset($this->matchedFileIDs[$fileID])) continue;
-			if (isset($this->snippets[$fileID])) $item['searchContentMatch'] = $this->snippets[$fileID];
-			$filtered[] = $item;
-		}
-		$listData['fileList'] = $filtered;
-		$listData['folderList'] = array();
-		if (!isset($listData['pageInfo']) || !is_array($listData['pageInfo'])) $listData['pageInfo'] = array();
-		$listData['pageInfo']['totalNum'] = count($filtered);
-		$listData['pageInfo']['pageTotal'] = 1;
-		$listData['disableSort'] = 1;
-		return $listData;
+		$applied = KodboxCorpusShare::applyContentHits($listData);
+		if ($applied) return $applied;
+		$bag = KodboxCorpusShare::contentHits();
+		if (!$bag || empty($bag['snippets'])) return;
+		return KodboxCorpusShare::overlaySnippets($listData);
 	}
 
 	public function listPathParse($data) {
-		if (!is_array($data) || empty($data['fileList']) || !$this->isOpen()) return $data;
+		if (!is_array($data)) return $data;
+		$data = KodboxCorpusShare::overlaySnippets($data);
+		if (empty($data['fileList']) || !$this->isOpen()) return $data;
 		try { $this->initTable(); } catch (Throwable $e) { return $data; }
 		$ids = array();
 		foreach ((array)$data['fileList'] as $item) {
@@ -257,14 +269,14 @@ class aiRagPlugin extends PluginBase {
 	}
 
 	public function fileContentText($file, $makeNow = false) {
-		if (!$this->isOpen()) return false;
+		if (!$this->isOpen()) return;
 		$fileID = intval(_get((array)$file, 'fileID', 0));
-		if (!$fileID) return false;
+		if (!$fileID) return;
 		try {
 			$content = $this->elastic()->getContent($fileID);
-			return $content !== '' ? $content : false;
+			return $content !== '' ? $content : null;
 		} catch (Throwable $e) {
-			return false;
+			return;
 		}
 	}
 
@@ -1290,12 +1302,12 @@ class aiRagPlugin extends PluginBase {
 				$toolCalls[] = array('name' => '联网搜索', 'ok' => $webText !== '', 'count' => $webText !== '' ? 1 : 0);
 				if ($webText === '') $notes[] = '联网搜索没有可用摘要';
 			}
-			$system = '你是企业网盘文档助手。不要编造合同编号、金额或条款。回答必须优先使用 Markdown（标题、列表、表格、加粗）。必须遵守用户本轮提出的篇幅、字数、条数要求。';
+			$system = '你是企业网盘文档助手。不要编造合同编号、金额或条款。用自然、简洁的中文回答。优先使用 Markdown：标题只用 ## 或 ###；对比用表格（| 列 | 列 |）；代码、命令、JSON、SQL 必须放在 fenced 代码块里（```语言）。必须遵守用户本轮提出的篇幅、字数、条数要求。';
 			$lengthHint = $this->askLengthHint($question);
 			if ($lengthHint !== '') $system .= ' '.$lengthHint;
 			if ($mail) $system .= '需要发邮件时只输出邮件草稿（收件人、主题、正文），不要声称已经发出。';
 			if ($save) $system .= '若用户要求保存为文件，用 [[SAVE:文件名]]内容[[/SAVE]] 包裹要写入网盘「AI助手」目录的正文。';
-			if ($thinking) $system .= '先简要给出思考要点，再给出结论。';
+			if ($thinking) $system .= '思考过程用两三句自然说明即可，不要用标题、编号或 Markdown 把思考写进正文。';
 			if ($context !== '') $system .= '必须依据下面「网盘资料」回答。引用资料时在相关句末写 [^n]，n 对应资料编号。资料里没有的内容明确说资料中未找到。';
 			else $system .= '当前没有检索到已入库的网盘资料，请明确告知用户「资料库没有命中」，不要编造文件内容。';
 			$messages = array(array('role' => 'system', 'content' => $system));
@@ -1560,6 +1572,8 @@ class aiRagPlugin extends PluginBase {
 				'chunks' => intval(_get($meta, 'chunkCount', 0)),
 				'size' => intval(_get($meta, 'size', 0)),
 				'path' => (string)_get($meta, 'path', ''),
+				'ext' => (string)_get($meta, 'ext', ''),
+				'fileThumb' => $this->diskCoverUrl($meta),
 			);
 		};
 		// 引用文件按分片顺序整篇喂入；文件过多时只整篇展开前几个，其余交给下面的检索命中
@@ -1826,6 +1840,17 @@ class aiRagPlugin extends PluginBase {
 		return array('flags' => $flags, 'byPath' => $byPath);
 	}
 
+	private function diskCoverUrl($meta) {
+		$path = (string)_get($meta, 'path', '');
+		if ($path === '') return '';
+		try {
+			$param = array('path' => $path, 'etag' => intval(_get($meta, 'modifyTime', 0)), 'width' => 250);
+			return (string)Action('user.index')->apiSignMake('plugin/fileThumb/cover', $param);
+		} catch (Throwable $e) {
+			return '';
+		}
+	}
+
 	private function hydrateState($row) {
 		$fileID = intval(_get($row, 'fileID', 0));
 		$sourceID = intval(_get($row, 'sourceID', 0));
@@ -1970,6 +1995,8 @@ class aiRagPlugin extends PluginBase {
 					$meta = $this->hydrateState(array('fileID' => $fileID));
 					if ((string)_get($meta, 'path', '') !== '') $src['path'] = $meta['path'];
 					if (empty($src['name'])) $src['name'] = $meta['name'];
+					if (empty($src['ext'])) $src['ext'] = (string)_get($meta, 'ext', '');
+					if (empty($src['fileThumb'])) $src['fileThumb'] = $this->diskCoverUrl($meta);
 				}
 				$sources[] = $src;
 			}
@@ -2198,7 +2225,16 @@ class aiRagPlugin extends PluginBase {
 	}
 
 	private function sanitizeSnippet($text) {
-		return AiRagTextNormalizer::clean($text);
+		$text = AiRagTextNormalizer::clean($text);
+		$text = str_replace(array('<', '>'), array(' ', ' '), $text);
+		$text = preg_replace('/\s+/u', ' ', $text);
+		$text = trim((string)$text);
+		if (function_exists('mb_substr')) {
+			if (mb_strlen($text, 'UTF-8') > 300) $text = mb_substr($text, 0, 300, 'UTF-8').'...';
+		} elseif (strlen($text) > 900) {
+			$text = substr($text, 0, 900).'...';
+		}
+		return $text;
 	}
 
 	private function escape($value) { return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8'); }

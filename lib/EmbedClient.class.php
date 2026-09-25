@@ -78,8 +78,8 @@ class AiRagEmbedClient {
 		return $vectors;
 	}
 
-	public function embedQuery($text) {
-		$vectors = $this->embed(array($text), 20);
+	public function embedQuery($text, $timeout = 20) {
+		$vectors = $this->embed(array($text), max(1, intval($timeout)));
 		return $vectors[0];
 	}
 

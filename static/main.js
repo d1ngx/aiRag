@@ -130,6 +130,25 @@
 	if(window.Router&&Router.mapIframe){
 		Router.mapIframe({page:'aiRag',title:'AI 助手',url:'{{pluginApi}}',ignoreLogin:false});
 	}
+	function fileThumbOf(item,$file){
+		item=item||{};
+		var src=item.fileThumb||item.filethumb||item.thumb||item.fileShowView||'';
+		if($file&&$file.length){
+			var img=$file.find('.picture img, .file-cover img, .path-ico img').attr('src');
+			if(img&&String(img).indexOf('user/view/call')<0) src=img;
+			else{
+				var bg=String($file.find('.picture,.file-cover').css('background-image')||'');
+				var m=bg.match(/url\(["']?([^"')]+)["']?\)/);
+				if(m&&m[1]&&m[1]!=='none'&&String(m[1]).indexOf('user/view/call')<0) src=m[1];
+			}
+			if(!src){
+				var data=$file.data()||{};
+				src=data.filethumb||data.fileThumb||data.fileshowview||data.fileShowView||'';
+			}
+		}
+		if(src&&String(src).indexOf('user/view/call')>=0) src='';
+		return src||'';
+	}
 	function selectedItems(){
 		var pathAction=_.get(window,'kodApp.pathAction');
 		if(!pathAction||!pathAction.makeParamSelect)return [];
@@ -138,13 +157,15 @@
 	function openChat(items){
 		items=_.filter(items||[],function(item){return item&&item.path;});
 		var refs=_.map(items,function(item){
+			var $file=$('.file').filter(function(){return $(this).attr('data-path')===item.path;}).first();
 			return {
 				path:item.path,
 				name:item.name||item.path,
 				type:item.type||(item.isFolder?'folder':'file'),
 				size:Number(item.size||0),
 				ext:item.ext||'',
-				fileThumb:item.fileThumb||item.filethumb||item.thumb||item.fileShowView||''
+				modifyTime:item.modifyTime||item.etag||'',
+				fileThumb:fileThumbOf(item,$file)
 			};
 		});
 		try{sessionStorage.setItem('airag.refs',JSON.stringify(refs));}catch(e){}
@@ -194,7 +215,7 @@
 		var path=$file.attr('data-path');
 		if(!path) return;
 		var data=$file.data()||{};
-		openChat([{path:path,name:$file.attr('data-name')||$.trim($file.find('.filename,.title,.name').first().clone().children().remove().end().text())||path,type:'file',size:data.size||0,ext:data.ext||'',fileThumb:data.filethumb||data.fileThumb||data.fileshowview||data.fileShowView||''}]);
+		openChat([{path:path,name:$file.attr('data-name')||$.trim($file.find('.filename,.title,.name').first().clone().children().remove().end().text())||path,type:'file',size:data.size||0,ext:data.ext||'',modifyTime:data.modifytime||data.modifyTime||'',fileThumb:fileThumbOf(data,$file)}]);
 	});
 	function askMenuItem(){
 		return {

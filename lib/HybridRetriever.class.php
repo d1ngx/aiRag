@@ -30,12 +30,24 @@ class AiRagHybridRetriever {
 		$vecHits = array();
 		if ($fileIDs !== null && !$fileIDs) return array('query'=>$parsed,'keywordHeavy'=>$keywordHeavy,'es'=>array(),'vector'=>array(),'hybrid'=>array());
 		if ($esOn) {
-			$esHits = $this->elastic->search($parsed['keyword'], $limit, $fileIDs, $filter);
-			if (!$esHits && $parsed['keyword'] !== $parsed['raw']) $esHits = $this->elastic->search($parsed['raw'], $limit, $fileIDs, $filter);
+			try {
+				$esHits = $this->elastic->search($parsed['keyword'], $limit, $fileIDs, $filter);
+				if (!$esHits && $parsed['keyword'] !== $parsed['raw']) $esHits = $this->elastic->search($parsed['raw'], $limit, $fileIDs, $filter);
+			} catch (Throwable $e) {
+				$esHits = array();
+			}
 		}
 		if ($vectorOn) {
-			$vector = $this->embed->embedQuery($parsed['raw']);
-			$vecHits = $this->milvus->search($vector, $limit, $fileIDs, $filter);
+			static $vectorDisabled = false;
+			if (!$vectorDisabled) {
+				try {
+					$vector = $this->embed->embedQuery($parsed['raw'], 2);
+					$vecHits = $this->milvus->search($vector, $limit, $fileIDs, $filter);
+				} catch (Throwable $e) {
+					$vectorDisabled = true;
+					$vecHits = array();
+				}
+			}
 		}
 		$wes = $keywordHeavy ? 1.6 : 0.9;
 		$wvec = $keywordHeavy ? 0.7 : 1.5;
@@ -57,7 +69,10 @@ class AiRagHybridRetriever {
 			$rrf[$id]['chunks'][$chunk] = $hit;
 			if (!isset($rrf[$id]['source']['vector'])) {
 				$rrf[$id]['score'] += $wvec / ($k + intval($hit['rank']));
-				$rrf[$id]['snippet'] = (string)_get($hit, 'text', '');
+				if ($rrf[$id]['snippet'] === '') {
+					$text = (string)_get($hit, 'text', '');
+					$rrf[$id]['snippet'] = function_exists('mb_substr') ? mb_substr($text, 0, 300, 'UTF-8') : substr($text, 0, 900);
+				}
 				if ($hit['name']) $rrf[$id]['name'] = $hit['name'];
 				$rrf[$id]['chunk'] = $chunk;
 				$rrf[$id]['source']['vector'] = $hit;

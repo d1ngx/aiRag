@@ -344,9 +344,9 @@ ClassBase.define({
 	},
 	pageSearch:function(){
 		return '<div class="airag-pane'+(this.page==='search'?' is-on':'')+'" data-pane="search"><h1>检索设置</h1>'+
-			this.sw('keywordEnabled','全文搜索增强','通过 Elasticsearch 对文本做关键词检索。')+
-			this.sw('semanticEnabled','全文搜索-语义检索','通过 Milvus 对搜索内容做向量混合检索。')+
-			this.sw('hybridEnabled','接管文件内容搜索','用混合检索替换 MariaDB MATCH AGAINST。')+
+			this.sw('keywordEnabled','AI 问答-关键词检索','仅用于 AI 提问时的 Elasticsearch 关键词召回。网盘勾选「文件内容」始终由 Elasticsearch 全文插件处理，不受此开关影响。')+
+			this.sw('semanticEnabled','全文搜索-语义检索','勾选「文件内容」时附加 Milvus 向量召回。关闭后网盘搜索不再请求 Embedding。')+
+			this.sw('hybridEnabled','接管文件内容搜索','开启后语义检索会参与网盘文件内容搜索；关闭则只走 Elasticsearch 全文插件。')+
 			'<h3>AI 问答设置</h3>'+
 			'<div class="airag-row"><div class="txt"><b>检索召回数量</b></div><div class="airag-slider"><input type="range" min="20" max="200" step="5" data-cfg="searchLimit" value="'+(this.cfg.searchLimit||80)+'"><span class="num">'+(this.cfg.searchLimit||80)+'</span></div></div>'+
 			'<div class="airag-row"><div class="txt"><b>AI 问答召回数量</b></div><div class="airag-slider"><input type="range" min="4" max="80" step="1" data-cfg="askLimit" value="'+(this.cfg.askLimit||20)+'"><span class="num">'+(this.cfg.askLimit||20)+'</span></div></div>'+

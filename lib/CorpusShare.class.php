@@ -116,4 +116,78 @@ class KodboxCorpusShare {
 		Model(self::AIRAG_TABLE)->setDataAuto(false);
 		return Model(self::AIRAG_TABLE)->add($data);
 	}
+
+	public static function contentHits() {
+		$bag = isset($GLOBALS['_kodboxContentSearch']) ? $GLOBALS['_kodboxContentSearch'] : array();
+		return is_array($bag) ? $bag : array();
+	}
+
+	public static function takeContentHits($param, $fileIDs, $snippets, $flag) {
+		$bag = self::contentHits();
+		if (!$bag) $bag = array('fileID' => array(), 'snippets' => array(), 'flags' => array());
+		$ids = array();
+		foreach ((array)$fileIDs as $id) {
+			$id = intval($id);
+			if ($id > 0) $ids[] = $id;
+		}
+		$bag['fileID'] = array_values(array_unique(array_merge((array)_get($bag, 'fileID', array()), $ids)));
+		foreach ((array)$snippets as $id => $text) {
+			$id = intval($id);
+			$text = trim((string)$text);
+			if ($id && $text !== '' && empty($bag['snippets'][$id])) $bag['snippets'][$id] = $text;
+		}
+		if (!isset($bag['flags']) || !is_array($bag['flags'])) $bag['flags'] = array();
+		$bag['flags'][$flag] = 1;
+		$GLOBALS['_kodboxContentSearch'] = $bag;
+		if (!is_array($param)) $param = array();
+		$param['fileID'] = $bag['fileID'] ? $bag['fileID'] : array(-1);
+		if (!empty($bag['flags']['elasticFulltext'])) $param['_elasticFulltext'] = 1;
+		if (!empty($bag['flags']['aiRag'])) $param['_aiRag'] = 1;
+		return $param;
+	}
+
+	public static function applyContentHits($listData) {
+		$bag = self::contentHits();
+		if (!$bag || empty($bag['fileID']) || !is_array($listData) || !isset($listData['fileList'])) return null;
+		$allow = array_flip($bag['fileID']);
+		$snippets = (array)_get($bag, 'snippets', array());
+		$filtered = array();
+		foreach ((array)$listData['fileList'] as $item) {
+			$fileID = intval(_get($item, 'fileID', _get($item, 'fileInfo.fileID', 0)));
+			if (!$fileID || !isset($allow[$fileID])) continue;
+			if (!empty($snippets[$fileID])) $item['searchContentMatch'] = $snippets[$fileID];
+			$filtered[] = $item;
+		}
+		$listData['fileList'] = $filtered;
+		$listData['folderList'] = array();
+		if (!isset($listData['pageInfo']) || !is_array($listData['pageInfo'])) $listData['pageInfo'] = array();
+		$listData['pageInfo']['totalNum'] = count($filtered);
+		$listData['pageInfo']['pageTotal'] = 1;
+		$listData['disableSort'] = 1;
+		return $listData;
+	}
+
+	public static function overlaySnippets($listData) {
+		$bag = self::contentHits();
+		if (!$bag || empty($bag['snippets']) || !is_array($listData) || empty($listData['fileList'])) return $listData;
+		$snippets = (array)_get($bag, 'snippets', array());
+		foreach ($listData['fileList'] as &$item) {
+			$fileID = intval(_get($item, 'fileID', _get($item, 'fileInfo.fileID', 0)));
+			if ($fileID && !empty($snippets[$fileID])) $item['searchContentMatch'] = $snippets[$fileID];
+		}
+		unset($item);
+		return $listData;
+	}
+
+	public static function putSnippets($snippets) {
+		$bag = self::contentHits();
+		if (!$bag) $bag = array('fileID' => array(), 'snippets' => array(), 'flags' => array());
+		if (!isset($bag['snippets']) || !is_array($bag['snippets'])) $bag['snippets'] = array();
+		foreach ((array)$snippets as $id => $text) {
+			$id = intval($id);
+			$text = trim((string)$text);
+			if ($id && $text !== '') $bag['snippets'][$id] = $text;
+		}
+		$GLOBALS['_kodboxContentSearch'] = $bag;
+	}
 }

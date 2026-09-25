@@ -2,7 +2,7 @@
 	"id": "aiRag",
 	"name": "{{LNG['aiRag.meta.name']}}",
 	"title": "{{LNG['aiRag.meta.title']}}",
-	"version": "1.6.9",
+	"version": "1.6.18",
 	"category": "tools,company",
 	"source": {
 		"thumb": "{{pluginHost}}static/icon.svg",

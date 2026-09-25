@@ -26,14 +26,71 @@
 			'<button type="button" class="airag-cite" data-act="cite" data-n="'+n+'" data-file="'+(src.fileID||'')+'" data-chunk="'+(src.chunk==null?-1:src.chunk)+'" data-path="'+esc(src.path||'')+'" title="打开引用 '+n+'">['+n+']</button>'+
 			'</span>';
 	}
-	function mdTable(block){
-		var lines=block.trim().split(/\n/).filter(function(l){return /\|/.test(l);});
-		if(lines.length<2) return esc(block);
-		var rows=lines.map(function(l){return l.replace(/^\||\|$/g,'').split('|').map(function(c){return c.trim();});});
-		if(/^[\s:|-]+$/.test(lines[1].replace(/\|/g,''))) rows.splice(1,1);
-		var head=rows.shift()||[];
-		var html='<table class="airag-md-table"><thead><tr>'+head.map(function(c){return '<th>'+inlineMd(c)+'</th>';}).join('')+'</tr></thead><tbody>';
-		html+=rows.map(function(r){return '<tr>'+r.map(function(c){return '<td>'+inlineMd(c)+'</td>';}).join('')+'</tr>';}).join('');
+	function mdCode(lang, code){
+		lang=String(lang||'').replace(/[^a-zA-Z0-9_+-]/g,'');
+		code=esc(String(code||'').replace(/\n$/,''));
+		return '<pre class="airag-md-code"'+(lang?' data-lang="'+lang+'"':'')+'><code'+(lang?' class="language-'+lang+'"':'')+'>'+code+'</code></pre>';
+	}
+	function joinParaLines(para){
+		var text='';
+		(para||[]).forEach(function(line){
+			line=String(line||'').replace(/^[ \t]+|[ \t]+$/g,'');
+			if(!line) return;
+			if(!text){ text=line; return; }
+			var prev=text.slice(-1), first=line.charAt(0);
+			if(/[A-Za-z0-9]$/.test(prev) && /[A-Za-z0-9]/.test(first)) text+=' '+line;
+			else text+=line;
+		});
+		return text;
+	}
+	function looksLikeCode(text){
+		var t=String(text||'').trim();
+		if(t.length<12) return false;
+		if(/[\u4e00-\u9fff]/.test(t) && !/[{};=<>]/.test(t)) return false;
+		if((t.charAt(0)==='{' || t.charAt(0)==='[') && /[\}\]]/.test(t.slice(-20)) && /"[^"]+"\s*:/.test(t)) return true;
+		if(/^(SELECT|INSERT|UPDATE|DELETE|WITH|CREATE|ALTER|DROP)\s+/i.test(t) && /\b(FROM|INTO|SET|TABLE|WHERE)\b/i.test(t)) return true;
+		if(/^(<\?php|<!DOCTYPE|<html|<svg|<script|<style|<div|<template)/i.test(t)) return true;
+		if(/^(import |from |export |function |const |let |var |class |def |public |package |using |fn )/m.test(t) && /[;{}()=]/.test(t)) return true;
+		if(/^(curl |docker |npm |pip |git |ssh |sudo )/m.test(t) && t.split('\n').length>=2) return true;
+		return false;
+	}
+	function tableCells(line){
+		var raw=String(line||'').replace(/｜/g,'|').trim();
+		if(raw.indexOf('|')<0) return null;
+		var edge=raw.charAt(0)==='|' || /\|+$/.test(raw);
+		var core=raw.replace(/^\|+/,'').replace(/\|+$/,'');
+		var cells=core.split('|').map(function(c){return c.trim();});
+		if(cells.length<2) return null;
+		var sep=cells.every(function(c){return /^:?-+:?$/.test(String(c).replace(/\s/g,''));});
+		return {cells:cells, edge:edge, sep:sep, pipes:(raw.match(/\|/g)||[]).length};
+	}
+	function isTableRow(line){
+		var info=tableCells(line);
+		if(!info) return false;
+		if(info.sep || info.edge || info.pipes>=2) return true;
+		return info.cells.length>=2 && / \| /.test(String(line).replace(/｜/g,'|'));
+	}
+	function isFenceLine(line){
+		return /^\s*(```|~~~)\s*([a-zA-Z0-9_+]*)\s*$/.exec(String(line||''));
+	}
+	function mdTableLines(buf, sources){
+		var rows=[], widths=0;
+		buf.forEach(function(line, idx){
+			var info=tableCells(line);
+			if(!info || (info.sep && idx===1)) return;
+			rows.push(info.cells);
+			if(info.cells.length>widths) widths=info.cells.length;
+		});
+		if(!rows.length) return '';
+		var head=rows.shift();
+		while(head.length<widths) head.push('');
+		function cells(r, tag){
+			r=r.slice();
+			while(r.length<widths) r.push('');
+			return r.slice(0,widths).map(function(c){return '<'+tag+'>'+inlineMd(c,sources)+'</'+tag+'>';}).join('');
+		}
+		var html='<table class="airag-md-table"><thead><tr>'+cells(head,'th')+'</tr></thead><tbody>';
+		html+=rows.map(function(r){return '<tr>'+cells(r,'td')+'</tr>';}).join('');
 		return html+'</tbody></table>';
 	}
 	function inlineMd(s, sources){
@@ -51,35 +108,63 @@
 	}
 	function md(src, sources){
 		src=String(src||'').replace(/\r\n/g,'\n');
-		var blocks=[];
-		src=src.replace(/```(\w*)\n?([\s\S]*?)```/g,function(_,lang,code){
-			blocks.push('<pre class="airag-md-code"><code>'+esc(code.replace(/\n$/,''))+'</code></pre>');
-			return '\u0000B'+(blocks.length-1)+'\u0000';
-		});
-		src=src.replace(/(?:(?:^|\n)(?:\|.+\|[ \t]*\n)+)/g,function(block){
-			blocks.push(mdTable(block));
-			return '\n\u0000B'+(blocks.length-1)+'\u0000\n';
-		});
-		var lines=src.split('\n'), out=[], list=null, para=[];
+		var blocks=[], rawLines=src.split('\n'), lined=[], i=0;
+		while(i<rawLines.length){
+			var fence=isFenceLine(rawLines[i]);
+			if(fence){
+				var mark=fence[1], lang=fence[2], code=[];
+				i++;
+				while(i<rawLines.length){
+					var close=isFenceLine(rawLines[i]);
+					if(close && close[1]===mark){ i++; break; }
+					code.push(rawLines[i]); i++;
+				}
+				blocks.push(mdCode(lang, code.join('\n')));
+				lined.push('\u0000B'+(blocks.length-1)+'\u0000');
+				continue;
+			}
+			lined.push(rawLines[i]); i++;
+		}
+		var lines=lined, out=[], list=null, para=[], quote=[], tableBuf=[];
 		function closeList(){ if(list){ out.push('</'+list+'>'); list=null; } }
+		function closeQuote(){
+			if(!quote.length) return;
+			out.push('<blockquote>'+quote.map(function(q){return '<p>'+inlineMd(q,sources)+'</p>';}).join('')+'</blockquote>');
+			quote=[];
+		}
+		function closeTable(){
+			if(!tableBuf.length) return;
+			closePara(); closeList(); closeQuote();
+			out.push(mdTableLines(tableBuf, sources));
+			tableBuf=[];
+		}
 		function closePara(){
 			if(!para.length) return;
-			var text='';
-			para.forEach(function(line){
-				line=String(line||'').replace(/^[ \t]+|[ \t]+$/g,'');
-				if(!line) return;
-				if(!text){ text=line; return; }
-				var prev=text.slice(-1), first=line.charAt(0);
-				if(/[A-Za-z0-9]$/.test(prev) && /[A-Za-z0-9]/.test(first)) text+=' '+line;
-				else text+=line;
-			});
-			if(text) out.push('<p>'+inlineMd(text,sources)+'</p>');
+			var text=joinParaLines(para);
+			if(text) out.push(looksLikeCode(text)?mdCode('',text):'<p>'+inlineMd(text,sources)+'</p>');
 			para=[];
 		}
 		lines.forEach(function(line){
-			if(/^\u0000B\d+\u0000$/.test(line.trim())){ closePara(); closeList(); out.push(line.trim()); return; }
+			if(/^\u0000B\d+\u0000$/.test(line.trim())){ closeTable(); closePara(); closeList(); closeQuote(); out.push(line.trim()); return; }
+			if(isTableRow(line)){
+				closeQuote();
+				tableBuf.push(line);
+				return;
+			}
+			if(tableBuf.length) closeTable();
 			var m;
-			if((m=line.match(/^(#{1,3})\s+(.+)/))){ closePara(); closeList(); out.push('<h'+(m[1].length+2)+'>'+inlineMd(m[2],sources)+'</h'+(m[1].length+2)+'>'); return; }
+			if(/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)){ closePara(); closeList(); closeQuote(); out.push('<hr>'); return; }
+			if(/^(#{1,6})(?:\s+|　)*$/.test(line)){ closePara(); closeList(); closeQuote(); return; }
+			if((m=line.match(/^(#{1,6})(?:(?:\s+|　)+|(?=[^\s#]))(.+?)\s*#*\s*$/))){
+				closePara(); closeList(); closeQuote();
+				var lv=Math.min(6, Math.max(2, m[1].length));
+				out.push('<h'+lv+'>'+inlineMd(m[2],sources)+'</h'+lv+'>'); return;
+			}
+			if((m=line.match(/^\s{0,3}>\s?(.*)$/))){
+				closePara(); closeList();
+				quote.push(m[1]); return;
+			}
+			if(quote.length) closeQuote();
 			if(/^\s*[-*]\s+/.test(line)){
 				closePara();
 				if(list!=='ul'){ closeList(); list='ul'; out.push('<ul>'); }
@@ -87,16 +172,114 @@
 			}
 			if(/^\s*\d+\.\s+/.test(line)){
 				closePara();
-				if(list!=='ol'){ closeList(); list='ol'; out.push('<ol>'); }
+				if(list!=='ol'){
+					closeList(); list='ol';
+					var start=parseInt(line,10)||1;
+					out.push(start>1?'<ol start="'+start+'">':'<ol>');
+				}
 				out.push('<li>'+inlineMd(line.replace(/^\s*\d+\.\s+/,''),sources)+'</li>'); return;
 			}
 			closeList();
 			if(!line.trim()){ closePara(); return; }
 			para.push(line);
 		});
+		closeTable();
 		closePara();
 		closeList();
+		closeQuote();
 		return out.join('').replace(/\u0000B(\d+)\u0000/g,function(_,n){return blocks[Number(n)]||'';});
+	}
+	function withCaret(html){
+		html=String(html||'');
+		if(!html) return '<i class="airag-caret"></i>';
+		var re=/<\/(p|li|h[1-6]|td|th|pre)>(?![\s\S]*<\/(?:p|li|h[1-6]|td|th|pre)>)/;
+		if(re.test(html)) return html.replace(re,'<i class="airag-caret"></i></$1>');
+		return html+'<i class="airag-caret"></i>';
+	}
+	// Blank lines outside code fences split the answer into blocks; during streaming
+	// only the last block is still changing, so earlier ones are rendered once.
+	function mdBlocks(src){
+		var out=[], cur=[], fence='';
+		String(src||'').replace(/\r\n/g,'\n').split('\n').forEach(function(line){
+			var f=isFenceLine(line);
+			if(f){
+				if(!fence) fence=f[1]; else if(f[1]===fence) fence='';
+				cur.push(line); return;
+			}
+			if(!fence && !line.trim()){
+				if(cur.length){ out.push(cur.join('\n')); cur=[]; }
+				return;
+			}
+			cur.push(line);
+		});
+		if(cur.length) out.push(cur.join('\n'));
+		return out;
+	}
+	// Hide half-typed markdown tokens so they never flash as raw characters.
+	// `open` means the last line has not received its newline yet.
+	function liveClean(block, open){
+		var lines=String(block||'').split('\n'), fence='';
+		lines.forEach(function(l){
+			var f=isFenceLine(l);
+			if(f){ if(!fence) fence=f[1]; else if(f[1]===fence) fence=''; }
+		});
+		if(fence){
+			if(open && /^\s*(`{1,2}|~{1,2})$/.test(lines[lines.length-1])) lines.pop();
+			return lines.join('\n')+'\n'+fence;
+		}
+		var n=lines.length;
+		if(open && n && (/[|｜]/.test(lines[n-1]) || (n>1 && isTableRow(lines[n-2])))) lines.pop();
+		if(lines.length && /^\s*(#{1,6}|[-*+>|]|\d+\.?|`{1,2}|-{1,2})\s*$/.test(lines[lines.length-1])) lines.pop();
+		var text=lines.join('\n');
+		text=text.replace(/\[\^?\d{0,3}$/,'').replace(/([^*])\*$/,'$1');
+		if(((text.match(/\*\*/g)||[]).length)%2) text=/\*\*$/.test(text)?text.slice(0,-2):text+'**';
+		if(((text.match(/`/g)||[]).length)%2) text=/`$/.test(text)?text.slice(0,-1):text+'`';
+		return text;
+	}
+	function lineOpen(src){ return !/\n\s*$/.test(String(src||'')); }
+	function renderBlock(block, sources, live, open){
+		return live?withCaret(md(liveClean(block, open),sources)):md(block,sources);
+	}
+	function mdHtml(src, sources, live){
+		var blocks=mdBlocks(src), open=lineOpen(src);
+		if(live && !blocks.length) blocks=[''];
+		return blocks.map(function(b,i){
+			return '<div class="airag-blk">'+renderBlock(b, sources, live && i===blocks.length-1, open)+'</div>';
+		}).join('');
+	}
+	function blockKeys(blocks, open){
+		return blocks.map(function(b,i){ return (i===blocks.length-1?(open?'L:':'C:'):'S:')+b; });
+	}
+	function primeStreamBlocks(mdEl, raw){
+		var blocks=mdBlocks(raw);
+		if(!blocks.length) blocks=[''];
+		var keys=blockKeys(blocks, lineOpen(raw)), ch=mdEl.children;
+		mdEl._blk=[];
+		for(var i=0;i<ch.length && i<keys.length;i++) mdEl._blk.push({key:keys[i], el:ch[i]});
+		mdEl._airagRaw=raw;
+	}
+	function renderStreamMd(mdEl, raw, sources){
+		var blocks=mdBlocks(raw);
+		if(!blocks.length) blocks=[''];
+		var open=lineOpen(raw), keys=blockKeys(blocks, open);
+		if(!mdEl._blk){ mdEl.innerHTML=''; mdEl._blk=[]; }
+		var list=mdEl._blk;
+		for(var i=0;i<blocks.length;i++){
+			var rec=list[i];
+			if(!rec){
+				var el=document.createElement('div');
+				el.className='airag-blk';
+				mdEl.appendChild(el);
+				rec=list[i]={key:'', el:el};
+			}
+			if(rec.key===keys[i]) continue;
+			rec.el.innerHTML=renderBlock(blocks[i], sources, i===blocks.length-1, open);
+			rec.key=keys[i];
+		}
+		while(list.length>blocks.length) list.pop().el.remove();
+	}
+	function isWaitCopy(s){
+		return !s || s==='正在检索资料…' || s==='正在整理资料…' || s==='正在思考…';
 	}
 	function sizeText(n){
 		n=parseInt(n,10)||0;
@@ -105,16 +288,59 @@
 		return (n/1048576).toFixed(1)+' MB';
 	}
 	function modelId(m){return typeof m==='string'?m:((m&&(m.id||m.name))||'');}
+	function readPrefModel(){
+		try{ return localStorage.getItem('airag-model')||''; }catch(e){ return ''; }
+	}
+	function savePrefModel(id){
+		if(!id) return;
+		try{ localStorage.setItem('airag-model', id); }catch(e){}
+	}
+	function modelBrand(m){
+		var s=(modelId(m)+' '+modelLabel(m)+' '+((m&&m.provider)||'')).toLowerCase();
+		if(/gpt|openai|chatgpt|\bo[1-4]\b|gpt-/.test(s)) return 'openai';
+		if(/deepseek/.test(s)) return 'deepseek';
+		if(/qwen|tongyi|dashscope|qwq/.test(s)) return 'qwen';
+		if(/claude|anthropic/.test(s)) return 'claude';
+		if(/gemini|gemma|google/.test(s)) return 'gemini';
+		if(/kimi|moonshot/.test(s)) return 'kimi';
+		if(/glm|chatglm|zhipu|智谱/.test(s)) return 'glm';
+		if(/doubao|seed-|volcengine|bytedance|豆包/.test(s)) return 'doubao';
+		if(/llama|meta-llama/.test(s)) return 'llama';
+		if(/mistral|mixtral|codestral/.test(s)) return 'mistral';
+		if(/grok|xai/.test(s)) return 'grok';
+		if(/\byi-|\byi\/|01-ai|01\.ai|零一/.test(s)) return 'yi';
+		if(/hunyuan|tencent|混元/.test(s)) return 'hunyuan';
+		if(/ernie|文心|baidu/.test(s)) return 'ernie';
+		if(/minimax|abab/.test(s)) return 'minimax';
+		if(/siliconflow|硅基/.test(s)) return 'silicon';
+		if(/bge|embed|e5/.test(s)) return 'embed';
+		if(/rerank/.test(s)) return 'rerank';
+		return 'llm';
+	}
 	function modelIcon(m){
-		var id=modelId(m), name=modelLabel(m)||'M';
-		var letter=name.replace(/^BAAI\//,'').charAt(0).toUpperCase();
-		var cls='is-llm';
-		if(/bge|embed|e5/i.test(id+name)) cls='is-embed';
-		else if(/rerank/i.test(id+name)) cls='is-rerank';
-		else if(/deepseek/i.test(id+name)) cls='is-deepseek';
-		else if(/qwen|tongyi/i.test(id+name)) cls='is-qwen';
-		else if(/gpt|openai/i.test(id+name)) cls='is-gpt';
-		return '<span class="airag-mico '+cls+'">'+esc(letter)+'</span>';
+		var brand=modelBrand(m);
+		var icons={
+			openai:'<svg viewBox="0 0 24 24"><path fill="currentColor" d="M22.28 9.82a6 6 0 0 0-.52-4.91 6.05 6.05 0 0 0-6.51-2.9A6.07 6.07 0 0 0 4.98 4.18a6 6 0 0 0-4 2.9 6.05 6.05 0 0 0 .74 7.1 6 6 0 0 0 .51 4.91 6.05 6.05 0 0 0 6.52 2.9A6 6 0 0 0 13.26 24a6.06 6.06 0 0 0 5.77-4.21 6 6 0 0 0 4-2.9 6.06 6.06 0 0 0-.75-7.07zM13.14 20.4a4.44 4.44 0 0 1-2.83-.8l.14-.08 4.78-2.76a.8.8 0 0 0 .39-.68v-6.74l2.02 1.17a.07.07 0 0 1 .04.05v5.59a4.5 4.5 0 0 1-4.54 4.25zM6.14 17.05a4.45 4.45 0 0 1-.53-2.99l.14.09 4.78 2.76a.77.77 0 0 0 .78 0l5.84-3.37v2.33a.08.08 0 0 1-.03.06L9.7 19.95a4.5 4.5 0 0 1-3.56-2.9zm-1.73-8.19A4.48 4.48 0 0 1 6.78 6.89V11.7a.77.77 0 0 0 .39.68l5.81 3.35-2.02 1.17a.08.08 0 0 1-.07 0l-4.83-2.79a4.5 4.5 0 0 1-1.65-5.25zm13.21-.21-4.8-2.77 2.02-1.16a.08.08 0 0 1 .07 0l4.83 2.79a4.49 4.49 0 0 1-.68 8.1v-5.67a.79.79 0 0 0-.4-.67zm2.3 6.2-.14-.09-4.78-2.79a.78.78 0 0 0-.78 0L9.41 14.6v-2.33a.07.07 0 0 1 .03-.06l4.83-2.79a4.5 4.5 0 0 1 6.7 4.63zM8.41 13.37l-2.02-1.16a.08.08 0 0 1-.04-.06V6.56a4.5 4.5 0 0 1 7.38-3.45l-.14.08-4.78 2.76a.8.8 0 0 0-.39.68zm1.06-7.01 4.78-2.76a.78.78 0 0 1 .79 0l4.78 2.76-2.02 1.17a.07.07 0 0 1-.08 0z"/></svg>',
+			deepseek:'<svg viewBox="0 0 24 24"><path fill="currentColor" d="M20.4 10.2c-.7-3.4-3.4-6-7.6-6.4-4.9-.5-8.8 2.6-9.5 7.1-.5 3.2.7 6 3.2 7.6 1.7 1.1 3.6 1.5 5.6 1.3 2.6-.2 4.4-1.2 5.8-3.1.4-.5.9-1.5 1.5-1.5 1.4 0 2.3-1.3 2-2.6-.2-.9-.6-1.7-1-2.4zm-8.7 6.3c-2.7 0-4.8-2-4.8-4.9 0-2.8 2.1-4.8 4.9-4.8 1.3 0 2.4.4 3.3 1.2.2.2.2.6 0 .8l-.7.7c-.2.2-.6.2-.8 0-.6-.5-1.2-.7-2-.7-1.7 0-2.9 1.3-2.9 2.8s1.2 2.9 2.9 2.9c.8 0 1.5-.3 2-.8.2-.2.6-.2.8 0l.7.7c.2.2.2.6 0 .8-.9.9-2 1.3-3.4 1.3zm5.3-4.2c0 .7-.5 1.2-1.1 1.2-.7 0-1.2-.5-1.2-1.2 0-.6.5-1.1 1.2-1.1.6 0 1.1.5 1.1 1.1z"/></svg>',
+			qwen:'<svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 2.4 14.7 8l5.9.5-4.5 3.9 1.4 5.8L12 15.7 6.5 18.2l1.4-5.8L3.4 8.5 9.3 8 12 2.4zm0 5.3-1.3 2.6-2.8.2 2.1 1.9-.7 2.8L12 13.7l2.7 1.5-.7-2.8 2.1-1.9-2.8-.2L12 7.7z"/></svg>',
+			claude:'<svg viewBox="0 0 24 24"><path fill="currentColor" d="M13.4 2.2h-2.8L3.2 21.8h3.1l1.6-4.2h7.9l1.7 4.2h3.1L13.4 2.2zm-4.3 12.6 2.8-7.4 2.8 7.4H9.1z"/></svg>',
+			gemini:'<svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 2c.4 4.8 2.5 8.1 10 10-7.5 1.9-9.6 5.2-10 10-.4-4.8-2.5-8.1-10-10C9.5 10.1 11.6 6.8 12 2z"/></svg>',
+			kimi:'<svg viewBox="0 0 24 24"><path fill="currentColor" d="M16.6 4.2A8.8 8.8 0 1 0 20 15.7 7.2 7.2 0 0 1 16.6 4.2z"/></svg>',
+			glm:'<svg viewBox="0 0 24 24"><path fill="currentColor" d="M7 4h10a3 3 0 0 1 3 3v7a3 3 0 0 1-3 3h-3.2L10 21.2V17H7a3 3 0 0 1-3-3V7a3 3 0 0 1 3-3zm2 4v2h6V8H9zm0 4v2h4v-2H9z"/></svg>',
+			doubao:'<svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 3c3.2 0 6.4 2.2 7.4 5.6 1.3 4.3-1 8.4-4.6 10.2-1.3.7-2.7 1-4 1.1-3.6.2-6.9-2-8-5.5C1.5 10.2 4.3 5.2 9 3.7c.9-.3 1.9-.5 3-.5zm-1.2 5.2c-.9.2-1.5 1.1-1.3 2 .2.9 1.1 1.5 2 1.3.9-.2 1.5-1.1 1.3-2-.2-.9-1.1-1.5-2-1.3z"/></svg>',
+			llama:'<svg viewBox="0 0 24 24"><path fill="currentColor" d="M7.5 6.5c2 0 3.4 1.1 4.5 2.8 1.1-1.7 2.5-2.8 4.5-2.8 2.7 0 4.5 2.2 4.5 5.2S19.2 17 16.5 17c-1.7 0-3-.7-4.5-2.2C10.5 16.3 9.2 17 7.5 17 4.8 17 3 14.7 3 11.7s1.8-5.2 4.5-5.2zm0 2.6c-1.3 0-2.1 1.1-2.1 2.6s.8 2.7 2.1 2.7c1.2 0 2.2-.8 3.4-2.7-1.2-1.9-2.2-2.6-3.4-2.6zm9 0c-1.2 0-2.2.7-3.4 2.6 1.2 1.9 2.2 2.7 3.4 2.7 1.3 0 2.1-1.2 2.1-2.7s-.8-2.6-2.1-2.6z"/></svg>',
+			mistral:'<svg viewBox="0 0 24 24"><path fill="currentColor" d="M3 19V5h4.2l4.8 7.4L16.8 5H21v14h-4.1v-7.3L13.8 19h-3.6L7.1 11.7V19H3z"/></svg>',
+			grok:'<svg viewBox="0 0 24 24"><path fill="currentColor" d="M4.2 4h4.1l4 5.4L16.6 4H21l-6.6 8.4L21.2 20h-4.2l-4.4-5.8L8 20H3.6l6.7-8.5L4.2 4z"/></svg>',
+			yi:'<svg viewBox="0 0 24 24"><path fill="currentColor" d="M6 4h4.2l4.1 9.6L18.6 4H22L15.4 20h-4.3L6 4z"/></svg>',
+			hunyuan:'<svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 2 3 7v10l9 5 9-5V7l-9-5zm0 3.2 5.5 3V12L12 8.8 6.5 12V8.2L12 5.2zM6.5 13.4 12 16.6l5.5-3.2V16L12 19.2 6.5 16v-2.6z"/></svg>',
+			ernie:'<svg viewBox="0 0 24 24"><path fill="currentColor" d="M5 5h14v3.2H9.4V11H18v3.1H9.4v2.6H19V20H5V5z"/></svg>',
+			minimax:'<svg viewBox="0 0 24 24"><path fill="currentColor" d="M4 19V5h3.8l4.2 8.4L16.2 5H20v14h-3.4v-8.3L13.4 19h-2.8L7.4 10.7V19H4z"/></svg>',
+			silicon:'<svg viewBox="0 0 24 24"><path fill="currentColor" d="M8 3h8l5 5v8l-5 5H8l-5-5V8l5-5zm1.2 3.2v11.6h5.6V6.2H9.2z"/></svg>',
+			embed:'<svg viewBox="0 0 24 24"><path fill="currentColor" d="M8.2 7.1 3 12l5.2 4.9 1.5-1.6L6 12l3.7-3.3-1.5-1.6zm7.6 0-1.5 1.6L18 12l-3.7 3.3 1.5 1.6L21 12l-5.2-4.9z"/></svg>',
+			rerank:'<svg viewBox="0 0 24 24"><path fill="currentColor" d="M7 5h13v2.4H7V5zm0 5.8h9.5V13H7v-2.2zm0 5.8h6V19H7v-2.4zM3.4 5H5.6v2.4H3.4V5zm0 5.8H5.6V13H3.4v-2.2zm0 5.8H5.6V19H3.4v-2.4z"/></svg>',
+			llm:'<svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 3.2 4 7.4v9.2l8 4.2 8-4.2V7.4L12 3.2zm0 2.4 5.4 2.8L12 11.2 6.6 8.4 12 5.6zM6.2 10.3l4.6 2.4v5.6l-4.6-2.4v-5.6zm7 8v-5.6l4.6-2.4v5.6L13.2 18.3z"/></svg>'
+		};
+		return '<span class="airag-mico is-'+brand+'" title="'+esc(modelLabel(m)||modelId(m))+'" aria-hidden="true">'+(icons[brand]||icons.llm)+'</span>';
 	}
 	function modelLabel(m){
 		if(!m) return '';
@@ -133,8 +359,11 @@
 	function applyModels(list, preferred){
 		state.models=normalizeModels(list);
 		var ids=state.models.map(function(m){return m.id;});
-		if(preferred && ids.indexOf(preferred)>=0) state.model=preferred;
-		else if(ids.indexOf(state.model)<0) state.model=ids[0]||'';
+		var pick='';
+		[readPrefModel(), state.model, preferred].forEach(function(id){
+			if(!pick && id && ids.indexOf(id)>=0) pick=id;
+		});
+		state.model=pick||ids[0]||'';
 	}
 	function parseJson(text){
 		try{return JSON.parse(text);}
@@ -228,7 +457,7 @@
 		(sources||[]).forEach(function(s,si){
 			var key=String(s.fileID||s.path||s.name||('i'+si));
 			if(!map[key]){
-				map[key]={fileID:s.fileID,name:s.name,path:s.path,size:s.size,chunks:s.chunks,items:[]};
+				map[key]={fileID:s.fileID,name:s.name,path:s.path,size:s.size,chunks:s.chunks,ext:s.ext||'',fileThumb:s.fileThumb||s.filethumb||'',items:[]};
 				list.push(map[key]);
 			}
 			map[key].items.push(s);
@@ -272,18 +501,80 @@
 	function icoBtn(act,title,path,on){
 		return '<button type="button" class="airag-ibtn'+(on?' is-on':'')+'" data-act="'+act+'" title="'+title+'"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'+path+'</svg></button>';
 	}
+	function hostWin(){
+		try{ if(window.parent && window.parent!==window) return window.parent; }catch(e){}
+		return window;
+	}
+	function isThumbSrc(src){
+		src=String(src||'').replace(/^["']|["']$/g,'');
+		return src && src!=='none' && src.indexOf('user/view/call')<0;
+	}
+	function fileExt(item){
+		item=item||{};
+		var ext=String(item.ext||'').replace(/^\./,'').toLowerCase();
+		if(!ext){
+			var n=String(item.name||item.path||'');
+			var i=n.lastIndexOf('.');
+			ext=i>=0?n.slice(i+1).toLowerCase():'';
+		}
+		ext=ext.replace(/[^a-z0-9]/g,'');
+		return ext||'file';
+	}
+	function staticBase(){
+		var w=hostWin();
+		var base=String(boot.staticPath||'');
+		try{
+			if(!base && w.G) base=w.G.staticPath||(w.G.appHost?w.G.appHost+'static/':'');
+		}catch(e){}
+		if(!base){
+			try{ base=(w.location.origin||'')+'/static/'; }catch(e){ base='/static/'; }
+		}
+		return /\/$/.test(base)?base:base+'/';
+	}
+	function typeIconUrl(ext){
+		return staticBase()+'images/file_icon/icon_file/'+(ext||'file')+'.png';
+	}
+	function cssUrl(value){
+		var m=String(value||'').match(/url\(["']?([^"')]+)["']?\)/);
+		return m?m[1]:'';
+	}
+	function explorerFileThumb(path){
+		try{
+			var w=hostWin();
+			var $=w.jQuery||w.$;
+			if(!$ || !path) return '';
+			var $file=$('.file').filter(function(){return $(this).attr('data-path')===path;}).first();
+			if(!$file.length) return '';
+			var src=$file.find('.picture img, .file-cover img').attr('src')||'';
+			if(isThumbSrc(src)) return src;
+			src=cssUrl($file.find('.picture,.file-cover').css('background-image'));
+			if(isThumbSrc(src)) return src;
+			src=cssUrl($file.find('.x-item-icon,.path-ico').css('background-image'));
+			if(isThumbSrc(src)) return src;
+			var data=$file.data()||{};
+			src=data.filethumb||data.fileThumb||data.fileshowview||data.fileShowView||'';
+			return isThumbSrc(src)?src:'';
+		}catch(e){ return ''; }
+	}
+	function diskThumb(item){
+		item=item||{};
+		var raw=item.fileThumb||item.filethumb||item.thumb||item.cover||item.fileShowView||'';
+		if(isThumbSrc(raw) && /fileThumb\/cover|\/cover_/.test(raw)) return raw;
+		var path=item.path||'';
+		if(!path) return '';
+		return explorerFileThumb(path);
+	}
 	function fileCover(item, extra){
 		item=item||{};
-		var name=item.name||item.path||'文件';
-		var ext=(String(name).split('.').pop()||'FILE').toUpperCase();
-		if(ext.length>5) ext='FILE';
-		var thumb=item.fileThumb||item.filethumb||item.thumb||item.cover||'';
-		if(!thumb && item.path){
-			var base=String(location.href||'').split('#')[0].split('?')[0];
-			thumb=base+'?plugin/fileThumb/cover&width=240&path='+encodeURIComponent(item.path)+'&name='+encodeURIComponent('/'+name);
-		}
-		return '<span class="airag-filecover'+(extra?' '+extra:'')+'"><em>'+esc(ext)+'</em>'+
-			(thumb?'<img src="'+esc(thumb)+'" alt="" loading="lazy" onerror="this.style.display=\'none\'">':'')+'</span>';
+		var ext=fileExt(item);
+		var icon=typeIconUrl(ext);
+		var cover=diskThumb(item);
+		if(cover && (cover===icon || /\/icon_file\//.test(cover))) cover='';
+		if(cover) item.fileThumb=cover;
+		return '<span class="airag-filecover'+(extra?' '+extra:'')+(cover?' has-thumb':'')+'">'+
+			'<i class="airag-type-icon" style="background-image:url(\''+esc(icon)+'\')"></i>'+
+			(cover?'<img src="'+esc(cover)+'" alt="" loading="lazy" onerror="this.remove();this.parentNode&&this.parentNode.classList.remove(\'has-thumb\')">':'')+
+			'</span>';
 	}
 	function fileCard(item){
 		if(!item) return '';
@@ -309,7 +600,7 @@
 		box.innerHTML=state.messages.map(function(msg,i){
 			var html='<div class="airag-msg '+esc(msg.role)+(msg.loading?' is-load':'')+'" data-i="'+i+'">';
 			if(msg.loading && !msg.streaming){
-				html+='<div class="airag-load"><span></span><span></span><span></span><em>'+esc(msg.content||'正在思考…')+'</em></div>';
+				html+='<div class="airag-load"><span></span><span></span><span></span><em>'+esc(msg.content||'正在整理资料…')+'</em></div>';
 			}else if(msg.role==='user'){
 				if(msg.editing){
 					html+='<div class="airag-user-bubble is-edit">';
@@ -328,26 +619,24 @@
 					tools=[{name:'知识库检索',ok:true,files:g0.length,chunks:msg.sources.length}];
 				}
 				if(tools.length){
-					html+='<div class="airag-calls">'+tools.map(function(t){
-						if((t.name||'')==='知识库检索' && msg.sources && msg.sources.length) return '<span class="'+(t.ok===false?'is-fail':'is-ok')+'">知识库检索完成</span>';
+					var chips=tools.map(function(t){
+						if((t.name||'')==='知识库检索' && msg.sources && msg.sources.length) return '';
 						return '<span class="'+(t.ok===false?'is-fail':'is-ok')+'" title="篇=命中文档数，片=喂给模型的分片数">'+esc(toolLabel(t))+'</span>';
-					}).join('')+'</div>';
+					}).filter(Boolean);
+					if(chips.length) html+='<div class="airag-calls">'+chips.join('')+'</div>';
 				}
 				if(msg.reasoning){
 					var thinkLive=msg.streaming&&!msg.answerStarted;
-					html+='<details class="airag-think-box'+(thinkLive?' is-live':'')+'"'+(thinkLive?' open':'')+'><summary>'+(thinkLive?'正在深度思考':'思考过程')+'</summary><div class="airag-think">'+esc(msg.reasoning)+'</div></details>';
+					html+='<details class="airag-think-box'+(thinkLive?' is-live':'')+'"'+(thinkLive?' open':'')+'><summary>'+(thinkLive?'思考中':'思考过程')+'</summary><div class="airag-think">'+esc(msg.reasoning)+'</div></details>';
 				}
-				html+='<div class="airag-msg-body airag-md">'+(msg.streaming?'<span class="airag-stream-text">'+esc(msg.content||'')+'</span><i class="airag-caret"></i>':md(msg.content||'',msg.sources||[]))+'</div>';
+				html+='<div class="airag-msg-body airag-md'+(msg.streaming?' is-live':'')+'">'+mdHtml(msg.content||'',msg.sources||[],!!msg.streaming)+'</div>';
 				if(!msg.streaming && msg.sources&&msg.sources.length){
 					var groups=groupSources(msg.sources);
-					html+='<details class="airag-refs-box"><summary>'+fileIco()+'<span>引用资料</span><b>'+groups.length+'</b><em>篇</em></summary><div class="airag-src-list">';
+					html+='<details class="airag-refs-box"><summary>'+fileIco()+'<span>知识库资料引用</span><b>'+groups.length+'</b><em>篇</em></summary><div class="airag-src-list">';
 					html+=groups.map(function(g){
-						return '<section class="airag-src-group"><div class="airag-src-title">'+fileIco()+'<b>'+esc(g.name||'资料')+'</b><em>'+g.items.length+' 片</em></div>'+
-							g.items.map(function(src){
-								var n=src.index||1;
-								return '<button type="button" class="airag-src-piece" data-act="cite" data-n="'+n+'" data-file="'+(g.fileID||'')+'" data-chunk="'+(src.chunk==null?-1:src.chunk)+'" data-path="'+esc(g.path||'')+'">'+
-									'<i>'+n+'</i><span>'+esc(src.snippet||'该分片暂无摘要，点击查看正文')+'</span></button>';
-							}).join('')+'</section>';
+						var first=g.items[0]||{};
+						return '<button type="button" class="airag-src-file" data-act="cite" data-n="'+(first.index||1)+'" data-file="'+(g.fileID||'')+'" data-chunk="'+(first.chunk==null?-1:first.chunk)+'" data-path="'+esc(g.path||'')+'">'+
+							fileCover(g,'is-chip')+'<b>'+esc(g.name||'资料')+'</b></button>';
 					}).join('');
 					html+='</div></details>';
 				}
@@ -373,6 +662,11 @@
 			}
 			return html+'</div>';
 		}).join('');
+		var liveMsg=lastBot();
+		if(liveMsg && liveMsg.streaming){
+			var liveEl=box.querySelector('.airag-msg.bot:last-child .airag-md');
+			if(liveEl) primeStreamBlocks(liveEl, liveMsg.content||'');
+		}
 		if(stayBottom) box.scrollTop=box.scrollHeight;
 		$('airag-new').disabled=state.busy;
 		$('airag-new').title=state.busy?'请先停止当前回复':'';
@@ -460,10 +754,12 @@
 			type:info.type||(info.isFolder?'folder':'file'),
 			size:Number(info.size||0),
 			ext:info.ext||'',
+			modifyTime:info.modifyTime||info.etag||'',
 			fileThumb:info.fileThumb||info.filethumb||info.thumb||info.fileShowView||''
 		};
 		if(!item.path) return;
 		if(state.refs.some(function(r){return r.path===item.path;})) return;
+		if(!isThumbSrc(item.fileThumb)) item.fileThumb=diskThumb(item);
 		state.refs.push(item);
 		renderRefs();
 	}
@@ -508,7 +804,6 @@
 				return m;
 			});
 			state.refs=item.refs&&item.refs.length?item.refs.slice():[];
-			if(item.model) state.model=item.model;
 			state.thinking=!!item.thinking;
 			state.tools=item.tools||state.tools;
 			['disk','web','mail','save'].forEach(function(k){setTool(k,state.tools[k]);});
@@ -544,7 +839,7 @@
 				var thinkBox=document.createElement('details');
 				thinkBox.className='airag-think-box is-live';
 				thinkBox.open=!msg.answerStarted;
-				thinkBox.innerHTML='<summary>'+(msg.answerStarted?'思考过程':'正在深度思考')+'</summary><div class="airag-think"></div>';
+				thinkBox.innerHTML='<summary>'+(msg.answerStarted?'思考过程':'思考中')+'</summary><div class="airag-think"></div>';
 				wrap.insertBefore(thinkBox, wrap.querySelector('.airag-md')||wrap.firstChild);
 				thinkEl=thinkBox.querySelector('.airag-think');
 			}
@@ -562,22 +857,20 @@
 			if(details){
 				details.classList.toggle('is-live',!msg.answerStarted);
 				var summary=details.querySelector('summary');
-				if(summary) summary.textContent=msg.answerStarted?'思考过程':'正在深度思考';
-				if(msg.answerStarted&&!msg.thinkCollapsed){details.open=false;msg.thinkCollapsed=true;}
+				if(summary) summary.textContent=msg.answerStarted?'思考过程':'思考中';
+				if(msg.answerStarted&&!msg.thinkCollapsed){
+					msg.thinkCollapsed=true;
+					if(details.open){
+						details.classList.add('is-folding');
+						setTimeout(function(){ details.open=false; details.classList.remove('is-folding'); }, 360);
+					}
+				}
 			}
 		}
 		var raw=msg.content||'';
 		if(mdEl&&mdEl._airagRaw!==raw){
-			var streamText=mdEl.querySelector('.airag-stream-text');
-			if(!streamText){
-				mdEl.innerHTML='<span class="airag-stream-text"></span><i class="airag-caret"></i>';
-				streamText=mdEl.querySelector('.airag-stream-text');
-			}
-			var shown=streamText._airagText||streamText.textContent||'';
-			var answerNode=streamText.firstChild;
-			if(raw.length>=shown.length && answerNode && answerNode.nodeType===3 && streamText.childNodes.length===1) answerNode.appendData(raw.slice(shown.length));
-			else streamText.textContent=raw;
-			streamText._airagText=raw;
+			mdEl.classList.add('is-live');
+			renderStreamMd(mdEl, raw, msg.sources||[]);
 			mdEl._airagRaw=raw;
 		}
 		scheduleStreamFollow(thinkEl);
@@ -591,21 +884,87 @@
 		if(streamRenderRaf) return;
 		streamRenderRaf=raf(function(){streamRenderRaf=0;patchStream();});
 	}
-	function typePush(s){
+	// Model tokens arrive in irregular bursts; queue them and release a few
+	// characters per frame so the answer flows at an even pace.
+	// The backlog is spread over roughly the observed gap between network chunks,
+	// so the text keeps moving until the next chunk lands instead of stalling.
+	var flow={raf:0, last:0, fast:false, waiters:[], lastIn:0, gap:0};
+	function flowRelease(msg, queue, field, dt){
+		var pend=msg[queue];
+		if(!pend) return false;
+		var span=flow.fast?0.12:Math.min(0.6, Math.max(0.25, flow.gap*1.4/1000));
+		var cps=Math.max(flow.fast?60:20, pend.length/span);
+		msg[queue+'Acc']=(msg[queue+'Acc']||0)+cps*dt/1000;
+		var n=Math.floor(msg[queue+'Acc']);
+		if(n<1) return false;
+		msg[queue+'Acc']-=n;
+		if(n>=pend.length) n=pend.length;
+		else{
+			var c=pend.charCodeAt(n-1);
+			if(c>=0xD800 && c<=0xDBFF) n++;
+		}
+		if(field==='content' && !msg.answerStarted){ msg.answerStarted=Date.now(); msg.thinkCollapsed=false; }
+		msg[field]=(msg[field]||'')+pend.slice(0,n);
+		msg[queue]=pend.slice(n);
+		return true;
+	}
+	function flowSettled(){
+		flow.fast=false; flow.last=0;
+		var list=flow.waiters; flow.waiters=[];
+		list.forEach(function(fn){ fn(); });
+	}
+	function flowStep(ts){
+		flow.raf=0;
+		var msg=lastBot();
+		if(!msg || !(msg._thinkQ || msg._ansQ)){ flowSettled(); return; }
+		var dt=flow.last?Math.min(64, ts-flow.last):16;
+		flow.last=ts;
+		var moved=flowRelease(msg, '_thinkQ', 'reasoning', dt);
+		if(!msg._thinkQ) moved=flowRelease(msg, '_ansQ', 'content', dt) || moved;
+		if(moved) patchStream();
+		if(msg._thinkQ || msg._ansQ) flow.raf=raf(flowStep);
+		else flowSettled();
+	}
+	function flowPush(queue, s){
 		if(!s) return;
 		var msg=lastBot();
 		if(!msg) return;
+		var now=Date.now();
 		if(!msg.streaming){
-			msg.loading=false;msg.streaming=true;
-			if(msg.content==='正在检索资料…') msg.content='';
+			msg.loading=false; msg.streaming=true;
+			if(isWaitCopy(msg.content)) msg.content='';
+			flow.lastIn=0; flow.gap=0;
 			renderLog();
 		}
-		if(!msg.answerStarted){msg.answerStarted=Date.now();msg.thinkCollapsed=false;}
-		msg.content=(msg.content||'')+s;
-		scheduleStreamPatch(false);
+		if(flow.lastIn){
+			var g=Math.min(1000, now-flow.lastIn);
+			flow.gap=flow.gap?flow.gap*0.75+g*0.25:g;
+		}
+		flow.lastIn=now;
+		msg[queue]=(msg[queue]||'')+s;
+		if(!flow.raf) flow.raf=raf(flowStep);
+	}
+	function typePush(s){ flowPush('_ansQ', s); }
+	function thinkPush(s){ flowPush('_thinkQ', s); }
+	function flowWait(){
+		var msg=lastBot();
+		if(!msg || !(msg._thinkQ || msg._ansQ)) return Promise.resolve();
+		if(document.hidden){ typeDrain(); return Promise.resolve(); }
+		flow.fast=true;
+		return new Promise(function(resolve){ flow.waiters.push(resolve); });
 	}
 	function typeDrain(){
+		var msg=lastBot();
+		if(flow.raf){ caf(flow.raf); flow.raf=0; }
+		if(msg){
+			if(msg._thinkQ){ msg.reasoning=(msg.reasoning||'')+msg._thinkQ; msg._thinkQ=''; }
+			if(msg._ansQ){
+				if(!msg.answerStarted) msg.answerStarted=Date.now();
+				msg.content=(msg.content||'')+msg._ansQ; msg._ansQ='';
+			}
+		}
 		scheduleStreamPatch(true);
+		flowSettled();
 	}
 	function parseSseBlock(block, onEvent){
 		var ev='message', data=[];
@@ -667,7 +1026,7 @@
 			created:(data&&data.created)||Math.floor(Date.now()/1000)
 		});
 		if(data&&data.id){state.id=data.id;state.title=data.title||state.title;}
-		if(data&&data.model) state.model=data.model;
+		if(data&&data.model){ state.model=data.model; savePrefModel(data.model); }
 		renderLog();renderModel();
 	}
 	function send(text){
@@ -675,18 +1034,19 @@
 		var q=(text!=null?text:(input.value||'')).trim();
 		if(!q||state.busy) return;
 		if(!state.model){ chatToast('没有可用的对话模型（检测未通过的已排除）'); return; }
+		savePrefModel(state.model);
 		hideCiteTip(0);
 		streamFollowBottom=true;
 		if(text==null) input.value='';
 		state.messages.push({role:'user',content:q,refs:state.refs.slice()});
-		state.messages.push({role:'bot',content:'正在检索资料…',loading:true,streaming:false});
+		state.messages.push({role:'bot',content:'正在整理资料…',loading:true,streaming:false});
 		state.busy=true;
 		state.waitSec=0;
 		if(state.waitTimer) clearInterval(state.waitTimer);
 		state.waitTimer=setInterval(function(){
 			state.waitSec++;
 			var em=document.querySelector('#airag-log .airag-load em');
-			if(em) em.textContent='正在检索资料… '+state.waitSec+'s';
+			if(em) em.textContent='正在整理资料… '+state.waitSec+'s';
 		},1000);
 		state.abort=typeof AbortController==='function'?new AbortController():null;
 		renderLog();
@@ -716,7 +1076,7 @@
 		}).then(function(res){
 			var ctype=String(res.headers.get('content-type')||'');
 			if(ctype.indexOf('text/event-stream')>=0){
-				var streamFail=null, finished=false;
+				var streamFail=null, finished=false, doneData=null;
 				return readSse(res, function(ev, data){
 					data=data||{};
 					var msg=lastBot();
@@ -734,17 +1094,16 @@
 						renderLog();
 					}
 					if(ev==='delta') typePush(data.text||'');
-					if(ev==='think'){
-						msg.reasoning=(msg.reasoning||'')+(data.text||'');
-						if(!msg.streaming){ msg.loading=false; msg.streaming=true; if(msg.content==='正在检索资料…') msg.content=''; renderLog(); }
-						else scheduleStreamPatch(false);
-					}
-					if(ev==='done'){ finished=true; finishBot(data); }
+					if(ev==='think') thinkPush(data.text||'');
+					if(ev==='done'){ finished=true; doneData=data; }
 					if(ev==='error') streamFail=new Error(data.message||'提问失败');
 				}).then(function(){
 					if(streamFail) throw streamFail;
+					return flowWait();
+				}).then(function(){
 					var msg=lastBot();
-					if(!finished && msg&&(msg.streaming||msg.loading)) finishBot(null, msg.content||'已停止生成');
+					if(finished) finishBot(doneData);
+					else if(msg&&(msg.streaming||msg.loading)) finishBot(null, msg.content||'已停止生成');
 				});
 			}
 			return res.text().then(function(text){
@@ -793,7 +1152,7 @@
 		var msg=lastBot();
 		if(msg&&(msg.streaming||msg.loading)){
 			msg.streaming=false; msg.loading=false;
-			if(!msg.content||msg.content==='正在检索资料…') msg.content='已停止生成';
+			if(isWaitCopy(msg.content)) msg.content='已停止生成';
 		}
 		renderLog();
 	}
@@ -878,14 +1237,22 @@
 			||all[Number(n)-1]||{};
 		var same=fileID?all.filter(function(s){return String(s.fileID||'')===String(fileID);}):[src];
 		if(!same.length) same=[src];
-		var nos=same.map(function(s){ return s.chunk!=null&&Number(s.chunk)>=0?Number(s.chunk)+1:Number(s.index||1); }).filter(Boolean);
-		var meta=sizeText(src.size||same[0]&&same[0].size)+' · '+(same.length>1?('引用 '+same.length+' 片（'+nos.join('、')+'）'):('分片 '+chunkPos(src)));
+		var fileRow=btn.classList.contains('airag-src-file');
+		var pieces=fileRow?same:[src];
+		var seen={}, bodies=[];
+		pieces.forEach(function(s,i){
+			var text=String(s.snippet||'').trim();
+			if(text && seen[text]) return;
+			if(text) seen[text]=1;
+			var no=s.chunk!=null&&Number(s.chunk)>=0?Number(s.chunk)+1:(i+1);
+			bodies.push('<div class="body">'+(pieces.length>1?'<em>分片 '+no+'</em>':'')+esc(text||'点击打开原文分片')+'</div>');
+		});
+		var meta=sizeText(src.size||same[0]&&same[0].size)+' · '+(same.length>1?(same.length+' 个分片'):('分片 '+chunkPos(src)));
 		var tip=document.createElement('div');
 		tip.id='airag-cite-tip';
 		tip.className='airag-cite-tip';
 		tip.innerHTML='<b>'+esc(src.name||same[0]&&same[0].name||'资料 '+n)+'</b>'+
-			'<span>'+esc(meta)+'</span>'+
-			'<div class="body">'+esc(src.snippet||'点击打开原文分片')+'</div>';
+			'<span>'+esc(meta)+'</span>'+bodies.join('');
 		document.body.appendChild(tip);
 		var r=btn.getBoundingClientRect();
 		tip.style.left=Math.max(8, Math.min(r.left, window.innerWidth-320))+'px';
@@ -1173,6 +1540,7 @@
 		var name=node&&node.getAttribute('data-model');
 		if(!name) return;
 		state.model=name;
+		savePrefModel(name);
 		closePop();
 		renderModel();
 	});
