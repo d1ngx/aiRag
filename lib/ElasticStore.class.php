@@ -138,6 +138,8 @@ class AiRagElasticStore {
 		if ($ext !== '') $clauses[] = array('term' => array('ext' => $ext));
 		$since = intval(_get($filter,'modifyTime',0));
 		if ($since) $clauses[] = array('range'=>array('modifyTime'=>array('gte'=>(string)$since,'format'=>'epoch_second')));
+		$ancestor = intval(_get($filter, 'ancestorID', 0));
+		if ($ancestor) $clauses[] = array('term' => array('ancestorIDs' => $ancestor));
 		if (intval(_get($filter,'parentID',0))) throw new RuntimeException('目录过滤必须由混合检索入口解析');
 		if ($clauses) $body['query']['bool']['filter'] = $clauses;
 		$response = AiRagHttpJson::request('POST', $this->url.'/'.$this->index.'/_search', $body, array(), 12);
@@ -156,6 +158,55 @@ class AiRagElasticStore {
 			);
 		}
 		return $result;
+	}
+
+	public function searchPage($words, $size, $searchAfter = null, $filter = null) {
+		$body = array(
+			'size' => max(1, min(300, intval($size))),
+			'_source' => array('fileID', 'name', 'content', 'ext', 'sourceID'),
+			'sort' => array(array('_score' => 'desc'), array('fileID' => 'asc')),
+			'query' => array('bool' => array(
+				'should' => array(
+					array('match_phrase' => array('content' => array('query' => (string)$words, 'boost' => 4))),
+					array('match' => array('content' => array('query' => (string)$words, 'operator' => 'and', 'boost' => 2))),
+					array('match' => array('name' => array('query' => (string)$words, 'boost' => 1.5))),
+				),
+				'minimum_should_match' => 1,
+			)),
+			'highlight' => array(
+				'pre_tags' => array(''),
+				'post_tags' => array(''),
+				'fields' => array('content' => array('fragment_size' => 240, 'number_of_fragments' => 1)),
+			),
+		);
+		$filter = is_array($filter) ? $filter : array();
+		$clauses = array();
+		if (!empty($filter['missingAncestors'])) $clauses[] = array('bool' => array('must_not' => array(array('exists' => array('field' => 'ancestorIDs')))));
+		$pageIDs = array_values(array_filter(array_map('intval', (array)_get($filter, 'fileIDs', array()))));
+		if (array_key_exists('fileIDs', $filter) && !$pageIDs) return array('hits' => array(), 'after' => null, 'more' => false);
+		if ($pageIDs) $clauses[] = array('terms' => array('fileID' => $pageIDs));
+		$source = intval(_get($filter, 'sourceID', 0));
+		if ($source) $clauses[] = array('term' => array('sourceID' => $source));
+		$ext = strtolower(preg_replace('/[^a-z0-9]+/', '', (string)_get($filter, 'ext', '')));
+		if ($ext !== '') $clauses[] = array('term' => array('ext' => $ext));
+		$since = intval(_get($filter, 'modifyTime', 0));
+		if ($since) $clauses[] = array('range' => array('modifyTime' => array('gte' => (string)$since, 'format' => 'epoch_second')));
+		if ($clauses) $body['query']['bool']['filter'] = $clauses;
+		if (is_array($searchAfter) && count($searchAfter) >= 2) $body['search_after'] = array($searchAfter[0], intval($searchAfter[1]));
+		$response = AiRagHttpJson::request('POST', $this->url.'/'.$this->index.'/_search', $body, array(), 12);
+		$hits = array();
+		$after = null;
+		foreach ((array)_get(_get($response, 'hits', array()), 'hits', array()) as $rank => $hit) {
+			$source = (array)_get($hit, '_source', array());
+			$highlight = (array)_get($hit, 'highlight', array());
+			$snippet = (string)_get(_get($highlight, 'content', array()), 0, '');
+			if ($snippet === '') $snippet = function_exists('mb_substr') ? mb_substr((string)_get($source, 'content', ''), 0, 240) : substr((string)_get($source, 'content', ''), 0, 240);
+			$fileID = intval(_get($source, 'fileID', _get($hit, '_id', 0)));
+			$sort = (array)_get($hit, 'sort', array());
+			if ($fileID) $hits[] = array('fileID' => $fileID, 'name' => (string)_get($source, 'name', ''), 'snippet' => $snippet, 'score' => floatval(_get($hit, '_score', 0)), 'rank' => $rank + 1);
+			if (count($sort) >= 2) $after = array($sort[0], intval($sort[1]));
+		}
+		return array('hits' => $hits, 'after' => $after, 'more' => count($hits) >= $body['size']);
 	}
 
 	public function deleteFile($fileID) {

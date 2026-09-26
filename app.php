@@ -198,11 +198,14 @@ class aiRagPlugin extends PluginBase {
 		$level = ob_get_level();
 		ob_start();
 		try {
+			$keywordHere = !empty(_get($this->getConfig(), 'keywordEnabled', 1)) && !KodboxCorpusShare::pluginEnabled('elasticFulltext');
 			$result = $this->retriever()->search(
 				$param['words'],
 				intval(_get($this->getConfig(), 'searchLimit', 80)),
-				!empty(_get($this->getConfig(), 'keywordEnabled', 1)),
-				true
+				$keywordHere,
+				true,
+				null,
+				array('parentID' => intval($param['parentID']))
 			);
 			$fileIDs = array();
 			$this->snippets = array();
@@ -347,6 +350,12 @@ class aiRagPlugin extends PluginBase {
 			$this->writeCursor($this->readCursor(), array('running' => 0, 'phase' => 'extract', 'current' => '', 'indexed' => $n));
 			return $n;
 		}
+		try {
+			$this->milvus()->ensureInfrastructure();
+			$this->backfillAncestors(microtime(true) + 8);
+		} catch (Throwable $e) {
+			$this->log('ancestor backfill skipped: '.$e->getMessage(), 'warning');
+		}
 		if ($esBusy) {
 			$this->log('skip extract: elasticFulltext 正在运行', 'warning');
 			return 0;
@@ -427,6 +436,7 @@ class aiRagPlugin extends PluginBase {
 		$pendingAll = intval(Model($this->stateTable)->where(array('status' => self::ST_ES))->count());
 		$doneAll = intval(Model($this->stateTable)->where(array('status' => self::ST_OK))->count());
 		$fileTotal = max(1, $pendingAll + $doneAll);
+		$this->backfillAncestors($deadline);
 		$rows = Model($this->stateTable)->where(array('status' => self::ST_ES))->order('indexTime asc')->limit($batch)->select();
 		$processed = 0; $failed = 0;
 		foreach ((array)$rows as $state) {
@@ -448,7 +458,7 @@ class aiRagPlugin extends PluginBase {
 			));
 			$result = $this->vectorizeFile($file, $config, $startedAt, $fileNo, $fileTotal);
 			if ($result === 'ok') $processed++;
-			else $failed++;
+			else if ($result === 'fail') $failed++;
 		}
 		$this->log('vector indexed='.$processed.' failed='.$failed);
 		return $processed;
@@ -514,10 +524,14 @@ class aiRagPlugin extends PluginBase {
 			// Server-confirmed rows are the only source of truth for resume.
 			$existing = $this->milvus()->hashesByFile($fileID);
 			$plan = AiRagMilvusStore::diffChunks($chunks, $existing, $model);
+			$wantAncestors = $this->milvus()->hasAncestorField() ? KodboxCorpusShare::ancestorIDs($fileID) : null;
+			if ($wantAncestors !== null) $file['ancestorIDs'] = $wantAncestors;
 			$refresh = array();
 			foreach ($plan['reuse'] as $index) {
 				$old = (array)$existing[$index];
-				if (intval(_get($old,'source_id',0)) !== intval(_get($file,'sourceID',0)) || intval(_get($old,'parent_id',0)) !== intval(_get($file,'parentID',0)) || intval(_get($old,'modify_time',0)) !== intval(_get($file,'modifyTime',0)) || (string)_get($old,'name','') !== mb_strcut($name,0,512,'UTF-8') || (string)_get($old,'ext','') !== (string)_get($file,'ext','')) $refresh[] = $index;
+				$moved = intval(_get($old,'source_id',0)) !== intval(_get($file,'sourceID',0)) || intval(_get($old,'parent_id',0)) !== intval(_get($file,'parentID',0)) || intval(_get($old,'modify_time',0)) !== intval(_get($file,'modifyTime',0)) || (string)_get($old,'name','') !== mb_strcut($name,0,512,'UTF-8') || (string)_get($old,'ext','') !== (string)_get($file,'ext','');
+				if (!$moved && $wantAncestors !== null && !$this->sameAncestors(_get($old, 'ancestor_ids', array()), $wantAncestors)) $moved = true;
+				if ($moved) $refresh[] = $index;
 			}
 			if ($refresh) $this->milvus()->refreshMetadata($fileID, $refresh, $file);
 			if (!$chunks) {
@@ -554,11 +568,12 @@ class aiRagPlugin extends PluginBase {
 					$rows[] = AiRagMilvusStore::row($batchMeta[$i], $vector);
 				}
 				$limit = max(50, min(500, intval(_get($config, 'milvusBatch', 300))));
+				$embedded = count($batchTexts);
 				if (count($rows) >= $limit) {
 					$self->milvus()->upsertChunks(array_slice($rows, 0, $limit), $limit, intval(_get($config, 'milvusPauseMs', 700)));
 					$rows = array_slice($rows, $limit);
-					$done += $limit;
 				}
+				$done += $embedded;
 				$self->writeCursor($self->readCursor(), array(
 					'running' => 1, 'phase' => 'vector', 'current' => $name, 'started' => $startedAt ?: time(),
 					'fileNo' => $fileNo, 'fileTotal' => $fileTotal, 'chunkDone' => $done, 'chunkTotal' => $total,
@@ -568,7 +583,7 @@ class aiRagPlugin extends PluginBase {
 			};
 			foreach ($work as $chunk) {
 				$batchTexts[] = $chunk['text'];
-				$batchMeta[] = array(
+				$meta = array(
 					'fileID' => $fileID,
 					'index' => $chunk['index'],
 					'text' => $chunk['text'],
@@ -579,6 +594,8 @@ class aiRagPlugin extends PluginBase {
 					'parentID' => intval(_get($file, 'parentID', 0)),
 					'modifyTime' => intval(_get($file, 'modifyTime', 0)),
 				);
+				if ($wantAncestors !== null) $meta['ancestorIDs'] = $wantAncestors;
+				$batchMeta[] = $meta;
 				if (count($batchTexts) >= 8) $flush();
 			}
 			$flush();
@@ -1268,18 +1285,33 @@ class aiRagPlugin extends PluginBase {
 			if ($disk) {
 				try {
 					$limit = max(4, min(40, intval(_get($this->getConfig(), 'askLimit', 20))));
-					$search = $this->retriever()->search($question, $limit, !empty(_get($this->getConfig(), 'keywordEnabled', 1)), !empty(_get($this->getConfig(), 'semanticEnabled', 1)), $scope['restricted'] ? $scope['fileIDs'] : null);
-					$hits = array_slice((array)$search['hybrid'], 0, 16);
+					$esOn = !empty(_get($this->getConfig(), 'keywordEnabled', 1));
+					$vecOn = !empty(_get($this->getConfig(), 'semanticEnabled', 1));
+					$fetch = min(40, max($limit, 32));
+					$retriever = $this->retriever();
+					$prepared = $retriever->prepare($question, $vecOn);
+					$parts = array();
+					if (!$scope['restricted']) {
+						$parts[] = $retriever->search($question, $fetch, $esOn, $vecOn, null, null, $prepared);
+					} else {
+						if ($scope['fileIDs']) $parts[] = $retriever->search($question, $fetch, $esOn, $vecOn, $scope['fileIDs'], null, $prepared);
+						foreach ((array)_get($scope, 'folderIDs', array()) as $folderID) {
+							$parts[] = $retriever->search($question, $fetch, $esOn, $vecOn, null, array('parentID' => intval($folderID)), $prepared);
+						}
+					}
+					$search = $this->mergeRetrieval($parts);
+					$hits = array_slice($this->keepVisibleHits((array)_get($search, 'hybrid', array())), 0, 16);
 				} catch (Throwable $e) {
 					$this->log('ask retrieve: '.$e->getMessage(), 'warning');
 					$notes[] = '网盘检索暂不可用：'.$e->getMessage();
 				}
-				if ($scope['fileIDs']) {
+				$visibleFiles = $this->visibleFileIDs($scope['fileIDs']);
+				if ($visibleFiles) {
 					$ready = 0;
-					try { $ready = intval(Model($this->stateTable)->where(array('fileID' => array('in', $scope['fileIDs']), 'status' => self::ST_OK))->count()); } catch (Throwable $e) {}
+					try { $ready = intval(Model($this->stateTable)->where(array('fileID' => array('in', $visibleFiles), 'status' => self::ST_OK))->count()); } catch (Throwable $e) {}
 					if (!$ready) $notes[] = '引用的文件尚未完成向量化，暂时没有正文可检索';
 				}
-				$pack = $this->prepareAskKnowledge($hits, $scope['fileIDs'], $knowChars);
+				$pack = $this->prepareAskKnowledge($hits, $visibleFiles, $knowChars);
 				$context = $pack['text'];
 				$sources = $pack['sources'];
 				$fileSet = array();
@@ -1511,8 +1543,140 @@ class aiRagPlugin extends PluginBase {
 		return implode('。', array_unique($bits));
 	}
 
+	private function backfillAncestors($deadline) {
+		if (microtime(true) >= $deadline) return;
+		$milvus = $this->milvus();
+		if (!$milvus->hasAncestorField()) return;
+		$data = $this->readCursorData();
+		$cursor = intval(_get($data, 'ancestorFileID', 0));
+		$batch = intval(_get($data, 'ancestorIdle', 0)) === 1 ? 16 : 48;
+		$rows = Model($this->stateTable)->where(array('status' => self::ST_OK, 'fileID' => array('gt', $cursor)))->order('fileID asc')->limit($batch)->select();
+		if (!$rows) {
+			$writes = intval(_get($this->readCursorData(), 'ancestorWrites', 0));
+			$errors = intval(_get($this->readCursorData(), 'ancestorErrors', 0));
+			$this->writeCursor($this->readCursor(), array(
+				'ancestorFileID' => 0,
+				'ancestorIdle' => ($writes === 0 && $errors === 0) ? 1 : 0,
+				'ancestorWrites' => 0,
+				'ancestorErrors' => 0,
+			));
+			return;
+		}
+		$done = $cursor;
+		$writes = intval(_get($data, 'ancestorWrites', 0));
+		$errors = intval(_get($data, 'ancestorErrors', 0));
+		foreach ((array)$rows as $state) {
+			if (microtime(true) >= $deadline) break;
+			$fileID = intval($state['fileID']);
+			$done = $fileID;
+			$file = Model('File')->where(array('fileID' => $fileID))->find();
+			if (!$file) continue;
+			$file = $this->attachSourceMeta($file);
+			$want = KodboxCorpusShare::ancestorIDs($fileID);
+			$file['ancestorIDs'] = $want;
+			try { $existing = $milvus->hashesByFile($fileID); } catch (Throwable $e) { $errors++; continue; }
+			$need = array();
+			foreach ((array)$existing as $index => $old) {
+				if (!$this->sameAncestors(_get($old, 'ancestor_ids', array()), $want)) $need[] = intval($index);
+			}
+			if (!$need) continue;
+			try {
+				$milvus->refreshMetadata($fileID, $need, $file);
+				$writes++;
+			} catch (Throwable $e) {
+				$errors++;
+				$this->log('ancestor backfill '.$fileID.' '.$e->getMessage(), 'warning');
+			}
+		}
+		$quiet = ($writes === 0 && $errors === 0) ? intval(_get($data, 'ancestorIdle', 0)) : 0;
+		$this->writeCursor($this->readCursor(), array('ancestorFileID' => $done, 'ancestorWrites' => $writes, 'ancestorErrors' => $errors, 'ancestorIdle' => $quiet));
+	}
+
+	private function sameAncestors($left, $right) {
+		$a = AiRagMilvusStore::ancestorList($left);
+		$b = AiRagMilvusStore::ancestorList($right);
+		sort($a);
+		sort($b);
+		return $a === $b;
+	}
+
+	private function mergeRetrieval($parts) {
+		$parts = array_values(array_filter((array)$parts));
+		if (!$parts) return array('query' => array(), 'keywordHeavy' => false, 'es' => array(), 'vector' => array(), 'hybrid' => array());
+		if (count($parts) === 1) return $parts[0];
+		$hybrid = array();
+		foreach ($parts as $part) {
+			foreach ((array)_get($part, 'hybrid', array()) as $hit) {
+				$id = intval(_get($hit, 'fileID', 0));
+				if (!$id) continue;
+				if (!isset($hybrid[$id]) || floatval(_get($hit, 'score', 0)) > floatval(_get($hybrid[$id], 'score', 0))) {
+					$previous = isset($hybrid[$id]) ? (array)_get($hybrid[$id], 'chunks', array()) : array();
+					$hybrid[$id] = $hit;
+					if (!isset($hybrid[$id]['chunks']) || !is_array($hybrid[$id]['chunks'])) $hybrid[$id]['chunks'] = array();
+					foreach ($previous as $chunk => $row) if (!isset($hybrid[$id]['chunks'][$chunk])) $hybrid[$id]['chunks'][$chunk] = $row;
+				} else {
+					if (!isset($hybrid[$id]['chunks']) || !is_array($hybrid[$id]['chunks'])) $hybrid[$id]['chunks'] = array();
+					foreach ((array)_get($hit, 'chunks', array()) as $chunk => $row) if (!isset($hybrid[$id]['chunks'][$chunk])) $hybrid[$id]['chunks'][$chunk] = $row;
+				}
+			}
+		}
+		$list = array_values($hybrid);
+		usort($list, function ($a, $b) {
+			if ($a['score'] == $b['score']) return 0;
+			return $a['score'] > $b['score'] ? -1 : 1;
+		});
+		$first = $parts[0];
+		$first['hybrid'] = $list;
+		return $first;
+	}
+
+	private function keepVisibleHits($hits) {
+		$ids = array();
+		foreach ((array)$hits as $hit) $ids[] = intval(_get($hit, 'fileID', 0));
+		$allow = array_flip($this->visibleFileIDs($ids));
+		$out = array();
+		foreach ((array)$hits as $hit) {
+			$id = intval(_get($hit, 'fileID', 0));
+			if ($id && isset($allow[$id])) $out[] = $hit;
+		}
+		return $out;
+	}
+
+	private function visibleFileIDs($fileIDs) {
+		$ids = array_values(array_unique(array_filter(array_map('intval', (array)$fileIDs))));
+		if (!$ids || !class_exists('KodIO') || !class_exists('KodUser') || !function_exists('Action') || !function_exists('Model')) return $ids;
+		try { if (KodUser::isRoot()) return $ids; } catch (Throwable $e) {}
+		$cap = min(2000, max(200, count($ids) * 24));
+		try { $rows = Model('Source')->where(array('fileID' => array('in', $ids), 'isFolder' => 0, 'isDelete' => 0))->field('fileID,sourceID')->limit($cap)->select(); }
+		catch (Throwable $e) { return $ids; }
+		$auth = Action('explorer.auth');
+		$ok = array();
+		foreach ((array)$rows as $row) {
+			$fid = intval(_get($row, 'fileID', 0));
+			$sid = intval(_get($row, 'sourceID', 0));
+			if (!$fid || !$sid || isset($ok[$fid])) continue;
+			try { if ($auth->fileCan(KodIO::make($sid), 'view')) $ok[$fid] = true; } catch (Throwable $e) {}
+		}
+		if (count((array)$rows) >= $cap) {
+			foreach ($ids as $fid) {
+				if (isset($ok[$fid])) continue;
+				try { $one = Model('Source')->where(array('fileID' => $fid, 'isFolder' => 0, 'isDelete' => 0))->field('sourceID')->limit(64)->select(); }
+				catch (Throwable $e) { continue; }
+				foreach ((array)$one as $row) {
+					$sid = intval(_get($row, 'sourceID', 0));
+					if (!$sid) continue;
+					try { if ($auth->fileCan(KodIO::make($sid), 'view')) { $ok[$fid] = true; break; } } catch (Throwable $e) {}
+				}
+			}
+		}
+		$out = array();
+		foreach ($ids as $id) if (isset($ok[$id])) $out[] = $id;
+		return $out;
+	}
+
 	private function resolveAskScope($paths) {
 		$fileIDs = array();
+		$folderIDs = array();
 		$labels = array();
 		foreach ((array)$paths as $path) {
 			if ($path === '') continue;
@@ -1520,17 +1684,8 @@ class aiRagPlugin extends PluginBase {
 			if (!is_array($info) || !$info) continue;
 			$labels[] = (string)_get($info, 'name', $path);
 			if (intval(_get($info, 'isFolder', 0))) {
-				$level = _get($info, 'parentLevel', '').intval(_get($info, 'sourceID', 0)).',';
-				$after = 0;
-				do {
-					$rows = Model('Source')->where(array('parentLevel'=>array('like',$level.'%'),'isFolder'=>0,'isDelete'=>0,'sourceID'=>array('gt',$after)))->field('fileID,sourceID')->order('sourceID asc')->limit(500)->select();
-					foreach ((array)$rows as $row) {
-						$after = intval($row['sourceID']);
-						$id = intval(_get($row,'fileID',0));
-						if ($id) $fileIDs[] = $id;
-					}
-				} while (count((array)$rows) === 500);
-
+				$folderID = intval(_get($info, 'sourceID', 0));
+				if ($folderID) $folderIDs[] = $folderID;
 			} else {
 				$id = intval(_get($info, 'fileID', 0));
 				if ($id) $fileIDs[] = $id;
@@ -1538,6 +1693,7 @@ class aiRagPlugin extends PluginBase {
 		}
 		return array(
 			'fileIDs' => array_values(array_unique($fileIDs)),
+			'folderIDs' => array_values(array_unique($folderIDs)),
 			'restricted' => count(array_filter((array)$paths, 'strlen')) > 0,
 			'labels' => array_slice(array_values(array_unique($labels)), 0, 8),
 		);
@@ -1662,28 +1818,41 @@ class aiRagPlugin extends PluginBase {
 		$timeFrom = 0;
 		$days = array('1d'=>1,'7d'=>7,'30d'=>30,'365d'=>365);
 		if (isset($days[$timeKey])) $timeFrom = time() - $days[$timeKey] * 86400;
-		$rows = Model($this->stateTable)->order('indexTime desc')->select();
-		if (!$rows) $rows = array();
-		$items = array();
-		foreach ((array)$rows as $row) {
-			$item = $this->hydrateState($row);
-			if ($statusWant !== null && intval($item['status']) !== $statusWant) continue;
-			if ($words !== '' && mb_stripos($item['name'].' '.$item['pathDisplay'].' '.$item['path'].' '.$item['fileID'], $words) === false) continue;
-			if ($exts && !in_array(strtolower((string)$item['ext']), $exts, true)) continue;
-			if ($sizeKey && isset($sizeRange[$sizeKey])) {
-				$n = intval($item['size']);
-				if ($n < $sizeRange[$sizeKey][0] || $n >= $sizeRange[$sizeKey][1]) continue;
+		$needSource = $words !== '' || $exts || ($sizeKey && isset($sizeRange[$sizeKey])) || $sourceID;
+		$stateWhere = array();
+		if ($statusWant !== null) $stateWhere['st.status'] = $statusWant;
+		if ($timeFrom) $stateWhere['st.modifyTime'] = array('egt', $timeFrom);
+		$join = $needSource ? $this->libraryJoin($words, $exts, ($sizeKey && isset($sizeRange[$sizeKey])) ? $sizeRange[$sizeKey] : null, $sourceID) : '';
+		$build = function() use ($stateWhere, $join) {
+			$q = Model($this->stateTable)->alias('st');
+			if ($join !== '') $q->join($join);
+			if ($stateWhere) $q->where($stateWhere);
+			return $q;
+		};
+		$limitSql = (($page - 1) * $size).','.$size;
+		if ($join !== '') {
+			$countRow = $build()->field('COUNT(DISTINCT st.fileID) AS total')->find();
+			$filtered = intval(_get($countRow, 'total', 0));
+			$idRows = $filtered ? $build()->field(array('st.fileID' => 'fileID', 'MAX(st.indexTime)' => 'indexTime'))->group('st.fileID')->order('MAX(st.indexTime) desc')->limit($limitSql)->select() : array();
+			$order = array();
+			foreach ((array)$idRows as $row) {
+				$id = intval(_get($row, 'fileID', 0));
+				if ($id) $order[] = $id;
 			}
-			if ($timeFrom && intval($item['modifyTime']) < $timeFrom) continue;
-			if ($sourceID) {
-				$parent = ','.trim((string)_get($item, 'parentLevel', ''), ',').',';
-				$okFolder = intval($item['sourceID']) === $sourceID || intval(_get($item, 'parentID', 0)) === $sourceID || strpos($parent, ','.$sourceID.',') !== false;
-				if (!$okFolder) continue;
+			$rows = array();
+			if ($order) {
+				$loaded = Model($this->stateTable)->where(array('fileID' => array('in', $order)))->select();
+				$byId = array();
+				foreach ((array)$loaded as $row) $byId[intval($row['fileID'])] = $row;
+				foreach ($order as $id) if (isset($byId[$id])) $rows[] = $byId[$id];
 			}
-			$items[] = $item;
+		} else {
+			$filtered = intval($build()->count());
+			$rows = $filtered ? $build()->field('st.*')->order('st.indexTime desc')->limit($limitSql)->select() : array();
 		}
-		$filtered = count($items);
-		$list = array_slice($items, ($page - 1) * $size, $size);
+		$items = array();
+		foreach ((array)$rows as $row) $items[] = $this->hydrateState($row);
+		$list = $items;
 		$scan = $this->scanProgress();
 		$stats = array(
 			'total' => intval(Model($this->stateTable)->count()),
@@ -1706,6 +1875,32 @@ class aiRagPlugin extends PluginBase {
 			'size' => $size,
 			'stats' => $stats,
 		);
+	}
+
+	private function libraryJoin($words, $exts, $sizeRange, $sourceID) {
+		$parts = array('src.isFolder=0', 'src.isDelete=0');
+		if ($sourceID) {
+			$prefix = KodboxCorpusShare::folderPrefix($sourceID);
+			$sid = intval($sourceID);
+			$parts[] = "(src.parentID=".$sid." OR src.parentLevel LIKE '".$prefix."%')";
+		}
+		$extList = array();
+		foreach ((array)$exts as $ext) {
+			$ext = preg_replace('/[^a-z0-9]/', '', strtolower((string)$ext));
+			if ($ext !== '') $extList[] = "'".$ext."'";
+		}
+		if ($extList) $parts[] = 'src.fileType IN ('.implode(',', $extList).')';
+		if (is_array($sizeRange)) {
+			$parts[] = 'src.size>='.intval($sizeRange[0]);
+			if ($sizeRange[1] < PHP_INT_MAX) $parts[] = 'src.size<'.intval($sizeRange[1]);
+		}
+		$words = str_replace(array('%', '_', '\\', "'"), '', (string)$words);
+		if ($words !== '') {
+			$match = "src.name LIKE '%".$words."%'";
+			if (ctype_digit($words)) $match = '('.$match.' OR src.fileID='.intval($words).')';
+			$parts[] = $match;
+		}
+		return 'INNER JOIN io_source src ON src.fileID=st.fileID AND '.implode(' AND ', $parts);
 	}
 
 	private function libraryEmpty($page, $size) {
@@ -2201,7 +2396,7 @@ class aiRagPlugin extends PluginBase {
 	private function writeCursor($fileID, $extra = null) {
 		$prev = $this->readCursorData();
 		$data = array('fileID' => intval($fileID), 'time' => time());
-		foreach (array('indexed', 'skipped', 'failed', 'scanned', 'running', 'chunkDone', 'chunkTotal', 'fileNo', 'fileTotal') as $key) {
+		foreach (array('indexed', 'skipped', 'failed', 'scanned', 'running', 'chunkDone', 'chunkTotal', 'fileNo', 'fileTotal', 'ancestorFileID', 'ancestorIdle', 'ancestorWrites', 'ancestorErrors') as $key) {
 			$data[$key] = is_array($extra) && array_key_exists($key, $extra) ? intval($extra[$key]) : intval(_get($prev, $key, 0));
 		}
 		$data['current'] = is_array($extra) && array_key_exists('current', $extra) ? (string)$extra['current'] : (string)_get($prev, 'current', '');

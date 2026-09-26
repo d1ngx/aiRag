@@ -179,6 +179,90 @@ class KodboxCorpusShare {
 		return $listData;
 	}
 
+	public static function folderPrefix($sourceID) {
+		static $cache = array();
+		$sourceID = intval($sourceID);
+		if ($sourceID <= 0) return '';
+		if (isset($cache[$sourceID])) return $cache[$sourceID];
+		$folder = array();
+		try { $folder = Model('Source')->where(array('sourceID' => $sourceID))->find(); } catch (Throwable $e) { $folder = array(); }
+		$prefix = preg_replace('/[^0-9,]/', '', rtrim((string)_get($folder, 'parentLevel', ''), ',').','.$sourceID.',');
+		$cache[$sourceID] = $prefix;
+		return $prefix;
+	}
+
+	// 只判断这一小批命中是否落在目录内，不把整个目录的文件编号读进检索请求。
+	public static function keepInFolder($sourceID, $fileIDs) {
+		$ids = array_values(array_unique(array_filter(array_map('intval', (array)$fileIDs))));
+		$sourceID = intval($sourceID);
+		if (!$ids || $sourceID <= 0 || !function_exists('Model')) return array();
+		$prefix = self::folderPrefix($sourceID);
+		$base = array('fileID' => array('in', $ids), 'isFolder' => 0, 'isDelete' => 0);
+		$direct = $base;
+		$direct['parentID'] = $sourceID;
+		$nested = $base;
+		$nested['parentLevel'] = array('like', $prefix.'%');
+		$keep = array();
+		foreach (array($direct, $nested) as $where) {
+			try { $rows = Model('Source')->where($where)->field('fileID')->limit(count($ids))->select(); }
+			catch (Throwable $e) { continue; }
+			foreach ((array)$rows as $row) {
+				$id = intval(_get($row, 'fileID', 0));
+				if ($id) $keep[$id] = $id;
+			}
+		}
+		return array_values($keep);
+	}
+
+	public static function ancestorIDs($fileID) {
+		$fileID = intval($fileID);
+		if ($fileID <= 0 || !function_exists('Model')) return array();
+		$ids = array();
+		$after = 0;
+		do {
+			try {
+				$rows = Model('Source')->where(array('fileID' => $fileID, 'isFolder' => 0, 'isDelete' => 0, 'sourceID' => array('gt', $after)))->field('sourceID,parentID,parentLevel')->order('sourceID asc')->limit(100)->select();
+			} catch (Throwable $e) { break; }
+			$n = 0;
+			foreach ((array)$rows as $row) {
+				$n++;
+				$after = intval(_get($row, 'sourceID', $after));
+				$parent = intval(_get($row, 'parentID', 0));
+				if ($parent > 0) $ids[$parent] = $parent;
+				foreach (explode(',', (string)_get($row, 'parentLevel', '')) as $part) {
+					$part = intval($part);
+					if ($part > 0) $ids[$part] = $part;
+				}
+				if (count($ids) >= 64) break 2;
+			}
+			if ($n < 100) break;
+		} while (count($ids) < 64);
+		return array_slice(array_values($ids), 0, 64);
+	}
+
+	public static function folderFileIDs($sourceID, $max = 4000) {
+		$sourceID = intval($sourceID);
+		$max = max(1, min(8000, intval($max)));
+		if ($sourceID <= 0 || !function_exists('Model')) return array('ids' => array(), 'complete' => true);
+		$prefix = self::folderPrefix($sourceID);
+		if ($prefix === '') return array('ids' => array(), 'complete' => false);
+		$limit = $max + 1;
+		$sql = "SELECT DISTINCT `fileID` AS `fileID` FROM `io_source` WHERE `isDelete`=0 AND `isFolder`=0 AND (`parentID`=".$sourceID." OR `parentLevel` LIKE '".addslashes($prefix)."%') LIMIT ".$limit;
+		try {
+			$rows = Model()->db()->query($sql);
+		} catch (Throwable $e) {
+			return array('ids' => array(), 'complete' => false);
+		}
+		if (!is_array($rows)) return array('ids' => array(), 'complete' => false);
+		if (count($rows) > $max) return array('ids' => array(), 'complete' => false);
+		$ids = array();
+		foreach ($rows as $row) {
+			$id = intval(is_array($row) ? _get($row, 'fileID', _get($row, 'fileid', 0)) : 0);
+			if ($id) $ids[$id] = $id;
+		}
+		return array('ids' => array_values($ids), 'complete' => true);
+	}
+
 	public static function putSnippets($snippets) {
 		$bag = self::contentHits();
 		if (!$bag) $bag = array('fileID' => array(), 'snippets' => array(), 'flags' => array());

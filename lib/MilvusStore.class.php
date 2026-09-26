@@ -6,6 +6,7 @@ class AiRagMilvusStore {
 	private $collection;
 	private $dim;
 	private $config;
+	private $ancestorReady = null;
 
 	public function __construct($config) {
 		$this->config = $config;
@@ -22,6 +23,7 @@ class AiRagMilvusStore {
 	public function ensureInfrastructure() {
 		if (!$this->collectionExists()) $this->createCollection();
 		$this->validateSchema();
+		$this->ensureAncestorField();
 		$this->post('/v2/vectordb/collections/load', array('collectionName' => $this->collection), 20, array(200, 201));
 		return true;
 	}
@@ -30,7 +32,12 @@ class AiRagMilvusStore {
 		$batchSize = max(50, min(500, intval($batchSize)));
 		$pauseMs = max(0, min(5000, intval($pauseMs)));
 		$chunks = array_chunk((array)$rows, $batchSize);
+		$keepAncestors = $this->hasAncestorField();
 		foreach ($chunks as $part) {
+			if (!$keepAncestors) {
+				foreach ($part as &$one) { if (is_array($one)) unset($one['ancestor_ids']); }
+				unset($one);
+			}
 			AiRagBackpressure::assertReady($this->config);
 			$this->post('/v2/vectordb/entities/upsert', array(
 				'collectionName' => $this->collection,
@@ -45,7 +52,7 @@ class AiRagMilvusStore {
 		$response = $this->post('/v2/vectordb/entities/query', array(
 			'collectionName' => $this->collection,
 			'filter' => 'file_id == '.intval($fileID),
-			'outputFields' => array('chunk_index', 'content_hash', 'source_id', 'parent_id', 'modify_time', 'name', 'ext'),
+			'outputFields' => array_merge(array('chunk_index', 'content_hash', 'source_id', 'parent_id', 'modify_time', 'name', 'ext'), $this->hasAncestorField() ? array('ancestor_ids') : array()),
 			'consistencyLevel' => 'Strong',
 			'limit' => 4096,
 		), 20, array(200, 201));
@@ -104,7 +111,7 @@ class AiRagMilvusStore {
 		return count($indexes);
 	}
 
-	public function search($vector, $limit, $fileIDs = null, $filter = null) {
+	public function search($vector, $limit, $fileIDs = null, $filter = null, $offset = 0, $groupByFile = false) {
 		$body = array(
 			'collectionName' => $this->collection,
 			'data' => array($vector),
@@ -114,6 +121,12 @@ class AiRagMilvusStore {
 			'outputFields' => array('file_id', 'chunk_index', 'text', 'name', 'ext', 'source_id'),
 			'searchParams' => array('metricType' => 'COSINE'),
 		);
+		if (intval($offset) > 0) $body['offset'] = intval($offset);
+		if ($groupByFile) {
+			$body['groupingField'] = 'file_id';
+			$body['groupSize'] = 3;
+			$body['strictGroupSize'] = false;
+		}
 		$expr = self::filterExpr($fileIDs, $filter);
 		if ($expr !== '') $body['filter'] = $expr;
 		$response = $this->post('/v2/vectordb/entities/search', $body, 20);
@@ -181,6 +194,11 @@ class AiRagMilvusStore {
 		$ids = array_values(array_filter(array_map('intval', (array)$fileIDs)));
 		if ($fileIDs !== null && !$ids) $parts[] = 'file_id < 0';
 		if ($ids) $parts[] = 'file_id in ['.implode(',', $ids).']';
+		$exclude = array_values(array_unique(array_filter(array_map('intval', (array)_get($filter, 'excludeFileIDs', array())))));
+		if ($exclude) $parts[] = 'file_id not in ['.implode(',', $exclude).']';
+		$ancestor = intval(_get($filter, 'ancestorID', 0));
+		if ($ancestor) $parts[] = 'ARRAY_CONTAINS(ancestor_ids, '.$ancestor.')';
+		if (!empty($filter['ancestorMissing'])) $parts[] = 'ancestor_ids is null';
 		$source = intval(_get($filter, 'sourceID', 0));
 		if ($source) $parts[] = 'source_id == '.$source;
 		$parent = intval(_get($filter, 'parentID', 0));
@@ -193,7 +211,7 @@ class AiRagMilvusStore {
 	}
 
 	public static function row($meta, $vector) {
-		return array(
+		$row = array(
 			'chunk_id' => self::chunkId(_get($meta, 'fileID', 0), _get($meta, 'index', 0)),
 			'file_id' => intval(_get($meta, 'fileID', 0)),
 			'source_id' => intval(_get($meta, 'sourceID', 0)),
@@ -206,6 +224,50 @@ class AiRagMilvusStore {
 			'modify_time' => intval(_get($meta, 'modifyTime', 0)),
 			'vector' => $vector,
 		);
+		if (array_key_exists('ancestorIDs', $meta)) $row['ancestor_ids'] = self::ancestorList(_get($meta, 'ancestorIDs', array()));
+		return $row;
+	}
+
+	public static function ancestorList($ids) {
+		$out = array();
+		foreach ((array)$ids as $id) {
+			$id = intval($id);
+			if ($id > 0) $out[$id] = $id;
+		}
+		return array_slice(array_values($out), 0, 64);
+	}
+
+	public function hasAncestorField() {
+		if ($this->ancestorReady !== null) return $this->ancestorReady;
+		try {
+			$result = $this->post('/v2/vectordb/collections/describe', array('collectionName' => $this->collection), 8);
+			$names = array();
+			foreach ((array)_get(_get($result, 'data', array()), 'fields', array()) as $field) $names[(string)_get($field, 'name', '')] = true;
+			$this->ancestorReady = isset($names['ancestor_ids']);
+		} catch (Throwable $e) {
+			$this->ancestorReady = false;
+		}
+		return $this->ancestorReady;
+	}
+
+	private function ensureAncestorField() {
+		if ($this->hasAncestorField()) return;
+		$this->ancestorReady = null;
+		try {
+			$this->post('/v2/vectordb/collections/fields/add', array(
+				'collectionName' => $this->collection,
+				'schema' => array(
+					'fieldName' => 'ancestor_ids',
+					'dataType' => 'Array',
+					'elementDataType' => 'Int64',
+					'nullable' => true,
+					'elementTypeParams' => array('max_capacity' => 64),
+				),
+			), 20);
+			try { $this->createIndex('ancestor_ids', 'idx_ancestor_ids', array('index_type' => 'AUTOINDEX')); } catch (Throwable $e) {}
+		} catch (Throwable $e) {}
+		$this->ancestorReady = null;
+		$this->hasAncestorField();
 	}
 
 	private function collectionExists() {
@@ -232,12 +294,13 @@ class AiRagMilvusStore {
 					array('fieldName' => 'ext', 'dataType' => 'VarChar', 'elementTypeParams' => array('max_length' => 16)),
 					array('fieldName' => 'content_hash', 'dataType' => 'VarChar', 'elementTypeParams' => array('max_length' => 40)),
 					array('fieldName' => 'modify_time', 'dataType' => 'Int64'),
+					array('fieldName' => 'ancestor_ids', 'dataType' => 'Array', 'elementDataType' => 'Int64', 'nullable' => true, 'elementTypeParams' => array('max_capacity' => 64)),
 					array('fieldName' => 'vector', 'dataType' => 'FloatVector', 'elementTypeParams' => array('dim' => (string)$this->dim)),
 				),
 			),
 		), 30);
 		$this->createIndex('vector', 'vector_cosine', array('metricType' => 'COSINE', 'index_type' => 'AUTOINDEX'));
-		foreach (array('file_id', 'source_id', 'parent_id', 'ext', 'modify_time') as $field) {
+		foreach (array('file_id', 'source_id', 'parent_id', 'ext', 'modify_time', 'ancestor_ids') as $field) {
 			$this->createIndex($field, 'idx_'.$field, array('index_type' => 'AUTOINDEX'));
 		}
 	}
@@ -272,12 +335,14 @@ class AiRagMilvusStore {
 			));
 			$rows = (array)_get($response, 'data', array());
 			if (count($rows) !== count($batch)) throw new RuntimeException('复用分片已变化，请重试');
+			$ancestors = $this->hasAncestorField() ? self::ancestorList(_get($file, 'ancestorIDs', array())) : null;
 			foreach ($rows as &$row) {
 				$row['source_id'] = intval(_get($file,'sourceID',0));
 				$row['parent_id'] = intval(_get($file,'parentID',0));
 				$row['modify_time'] = intval(_get($file,'modifyTime',0));
 				$row['name'] = mb_strcut((string)_get($file,'name',''),0,512,'UTF-8');
 				$row['ext'] = substr(strtolower(preg_replace('/[^a-z0-9]+/','',(string)_get($file,'ext',''))),0,16);
+				if ($ancestors !== null) $row['ancestor_ids'] = $ancestors;
 			}
 			unset($row);
 			$this->upsertChunks($rows, 50, intval(_get($this->config,'milvusPauseMs',700)));
