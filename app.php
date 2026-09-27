@@ -11,6 +11,9 @@ class aiRagPlugin extends PluginBase {
 	const ST_SKIP = 3;
 	const ST_FAIL = 4;
 	const ST_WAIT = 5;
+	const ST_DELETE = 6;
+	private $retrievalPolicy = null;
+	private $milvusStores = array();
 
 	public function __construct() {
 		parent::__construct();
@@ -276,6 +279,7 @@ class aiRagPlugin extends PluginBase {
 		$fileID = intval(_get((array)$file, 'fileID', 0));
 		if (!$fileID) return;
 		try {
+			if (!$this->policy()->allowedIDs(array($fileID))) return;
 			$content = $this->elastic()->getContent($fileID);
 			return $content !== '' ? $content : null;
 		} catch (Throwable $e) {
@@ -302,6 +306,8 @@ class aiRagPlugin extends PluginBase {
 			@ignore_user_abort(true);
 			if (class_exists('KodLog')) KodLog::$checkClientAbort = false;
 			$this->initTable();
+			AiRagBackpressure::assertReady($this->getConfig());
+			$this->retryDeletes();
 			if ($retryID !== null) {
 				AiRagBackpressure::assertReady($this->getConfig());
 				return $retryID ? $this->retryFile($retryID, true) : $this->retryFailed();
@@ -456,7 +462,7 @@ class aiRagPlugin extends PluginBase {
 				'started' => $startedAt, 'indexed' => $processed, 'failed' => $failed,
 				'fileNo' => $fileNo, 'fileTotal' => $fileTotal, 'chunkDone' => 0, 'chunkTotal' => 0,
 			));
-			$result = $this->vectorizeFile($file, $config, $startedAt, $fileNo, $fileTotal);
+			$result = $this->vectorizeFile($file, $config, $startedAt, $fileNo, $fileTotal, $deadline);
 			if ($result === 'ok') $processed++;
 			else if ($result === 'fail') $failed++;
 		}
@@ -469,8 +475,7 @@ class aiRagPlugin extends PluginBase {
 		$modifyTime = intval(_get($file, 'modifyTime', 0));
 		if (!$fileID) return false;
 		$state = Model($this->stateTable)->where(array('fileID' => $fileID))->find();
-		if ($state && _get($state, 'error', '') === '已禁用') return false;
-		if ($state && intval($state['modifyTime']) >= $modifyTime && in_array(intval($state['status']), array(self::ST_ES, self::ST_SKIP), true)) return false;
+		if ($state && (_get($state, 'error', '') === '已禁用' || intval($state['status']) === self::ST_DELETE)) return false;
 		$maxBytes = intval(_get($config, 'maxFileSizeMB', 30)) * 1024 * 1024;
 		if (intval(_get($file, 'size', 0)) <= 0) {
 			$this->saveState($file, self::ST_SKIP, 0, '', '空文件');
@@ -481,6 +486,11 @@ class aiRagPlugin extends PluginBase {
 			$this->log('skip '.$this->fileLabel($file).' 超过大小限制', 'warning');
 			return 'skip';
 		}
+		if (!in_array($ext, $this->configuredExtensions($config), true)) {
+			$this->saveState($file, self::ST_SKIP, 0, '', '扩展名已不在索引范围');
+			return 'skip';
+		}
+		if ($state && intval($state['modifyTime']) >= $modifyTime && intval($state['status']) === self::ST_ES) return false;
 		try {
 			$doc = $this->elastic($config)->getDocument($fileID);
 			if (!KodboxCorpusShare::isFresh($doc, $modifyTime, KodboxCorpusShare::extractVersion())) {
@@ -492,7 +502,7 @@ class aiRagPlugin extends PluginBase {
 			if ($state && intval($state['status']) === self::ST_OK && (string)_get($state,'contentHash','') === $this->vectorStateHash($extracted, $file, $config, $this->embed($config)->fingerprint())) return false;
 			$origin = 'elasticFulltext';
 			$hash = sha1($extracted);
-			$this->saveState($file, self::ST_ES, 0, $hash, '');
+			$this->saveState($file, self::ST_ES, intval(_get($state, 'chunkCount', 0)), $hash, '');
 			$this->log('es '.$this->fileLabel($file).' chars='.strlen($extracted).' via='.$origin);
 			return 'ok';
 		} catch (Throwable $e) {
@@ -502,10 +512,22 @@ class aiRagPlugin extends PluginBase {
 		}
 	}
 
-	private function vectorizeFile($file, $config, $startedAt = 0, $fileNo = 1, $fileTotal = 1) {
+	private function vectorizeFile($file, $config, $startedAt = 0, $fileNo = 1, $fileTotal = 1, $deadline = 0) {
+		$deadline = $deadline > 0 ? $deadline : microtime(true) + 50;
+		$state = Model($this->stateTable)->where(array('fileID' => intval($file['fileID'])))->find();
+		if ($state && (intval($state['status']) === self::ST_DELETE || _get($state, 'error', '') === '已禁用')) return 'skip';
 		$file = $this->attachSourceMeta($file);
 		$fileID = intval($file['fileID']);
 		$name = (string)_get($file, 'name', '');
+		$ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
+		if (!in_array($ext, $this->configuredExtensions($config), true)) {
+			$this->saveState($file, self::ST_SKIP, 0, '', '扩展名已不在索引范围');
+			return 'skip';
+		}
+		if (isset($file['size']) && (intval($file['size']) <= 0 || intval($file['size']) >= max(1, intval(_get($config, 'maxFileSizeMB', 30))) * 1024 * 1024)) {
+			$this->saveState($file, self::ST_SKIP, 0, '', '当前大小限制已排除');
+			return 'skip';
+		}
 		try {
 			$doc = $this->elastic($config)->getDocument($fileID);
 			if (!KodboxCorpusShare::isFresh($doc, intval(_get($file, 'modifyTime', 0)), KodboxCorpusShare::extractVersion())) {
@@ -522,7 +544,10 @@ class aiRagPlugin extends PluginBase {
 			$model = $embed->fingerprint();
 			$stateHash = $this->vectorStateHash($text, $file, $config, $model);
 			// Server-confirmed rows are the only source of truth for resume.
-			$existing = $this->milvus()->hashesByFile($fileID);
+			$highWater = max(count($chunks), intval(_get($state, 'chunkCount', 0)));
+			// Persist the largest attempted extent before writes so shortening after a failed run can remove the old tail.
+			if ($this->saveState($file, self::ST_ES, $highWater, $stateHash, '') === false) throw new RuntimeException('无法保存向量化范围');
+			$existing = $this->milvus($config)->hashesByFile($fileID, $highWater);
 			$plan = AiRagMilvusStore::diffChunks($chunks, $existing, $model);
 			$wantAncestors = $this->milvus()->hasAncestorField() ? KodboxCorpusShare::ancestorIDs($fileID) : null;
 			if ($wantAncestors !== null) $file['ancestorIDs'] = $wantAncestors;
@@ -582,6 +607,11 @@ class aiRagPlugin extends PluginBase {
 				$batchMeta = array();
 			};
 			foreach ($work as $chunk) {
+				if (microtime(true) >= $deadline && !$batchTexts) {
+					// Commit already embedded rows before yielding; resume trusts only server hashes.
+					if ($rows) $this->milvus($config)->upsertChunks($rows, intval(_get($config, 'milvusBatch', 300)), intval(_get($config, 'milvusPauseMs', 700)));
+					return 'yield';
+				}
 				$batchTexts[] = $chunk['text'];
 				$meta = array(
 					'fileID' => $fileID,
@@ -589,6 +619,7 @@ class aiRagPlugin extends PluginBase {
 					'text' => $chunk['text'],
 					'name' => $name,
 					'hash' => $chunk['hash'],
+					'modelVersion' => $model,
 					'ext' => (string)_get($file, 'ext', ''),
 					'sourceID' => intval(_get($file, 'sourceID', 0)),
 					'parentID' => intval(_get($file, 'parentID', 0)),
@@ -608,14 +639,14 @@ class aiRagPlugin extends PluginBase {
 		} catch (AiRagPressureException $e) {
 			throw $e; // 保持 ST_ES，下一轮继续。
 		} catch (Throwable $e) {
-			$this->saveState($file, self::ST_FAIL, 0, '', $this->shortError($e->getMessage()));
+			$this->saveState($file, self::ST_FAIL, isset($highWater) ? $highWater : intval(_get($state, 'chunkCount', 0)), '', $this->shortError($e->getMessage()));
 			$this->log('vector fail '.$this->fileLabel($file).' '.$e->getMessage(), 'error');
 			return 'fail';
 		}
 	}
 
 	private function vectorStateHash($text, $file, $config, $model) {
-		return sha1($text."\0".$model.json_encode(array(
+		return sha1("chunker-v2\0".$text."\0".$model.json_encode(array(
 			_get($config,'chunkSize',800), _get($config,'chunkOverlap',120), _get($config,'prependName',1),
 			_get($file,'name',''), _get($file,'sourceID',0), _get($file,'parentID',0), _get($file,'modifyTime',0), _get($file,'ext',''),
 		)));
@@ -654,7 +685,10 @@ class aiRagPlugin extends PluginBase {
 			'started' => time(), 'fileNo' => 1, 'fileTotal' => 1, 'chunkDone' => 0, 'chunkTotal' => 0,
 		));
 		$result = $this->extractFile($file, $ext, $config);
-		if ($result === false) $result = 'ok';
+		if ($result === false) {
+			$state = Model($this->stateTable)->where(array('fileID' => intval($fileID)))->find();
+			$result = $state && in_array(intval($state['status']), array(self::ST_ES, self::ST_OK), true) ? 'ok' : 'skip';
+		}
 		if ($result === 'ok' && $vectorToo && _get($config, 'serialPhase', 1) != '1') {
 			AiRagBackpressure::assertReady($config);
 			$this->milvus()->ensureInfrastructure();
@@ -704,6 +738,7 @@ class aiRagPlugin extends PluginBase {
 			'indexTime' => time(),
 		);
 		$exists = Model($this->stateTable)->where(array('fileID' => $fileID))->find();
+		if ($exists && !$chunks && in_array($status, array(self::ST_ES, self::ST_FAIL, self::ST_WAIT, self::ST_SKIP), true)) $data['chunkCount'] = intval(_get($exists, 'chunkCount', 0));
 		if ($exists) return Model($this->stateTable)->where(array('fileID' => $fileID))->save($data);
 		$data['fileID'] = $fileID;
 		Model($this->stateTable)->setDataAuto(false);
@@ -723,9 +758,25 @@ class aiRagPlugin extends PluginBase {
 	}
 
 	private function dropFile($fileID) {
-		@unlink(rtrim(TEMP_PATH, '/\\').'/airag-vector-'.intval($fileID).'.json');
-		try { $this->milvus()->deleteFile($fileID); } catch (Throwable $e) {}
-		Model($this->stateTable)->where(array('fileID' => $fileID))->delete();
+		$fileID = intval($fileID);
+		// Persist the tombstone before remote I/O. Failed deletes remain excluded and retryable.
+		$state = Model($this->stateTable)->where(array('fileID' => $fileID))->find();
+		if ($this->saveState(array_merge((array)$state, array('fileID' => $fileID)), self::ST_DELETE, 0, '', '等待删除向量') === false) throw new RuntimeException('无法保存删除任务');
+		$this->retrievalPolicy = null;
+		$this->milvus()->deleteFile($fileID);
+		if (Model($this->stateTable)->where(array('fileID' => $fileID))->delete() === false) throw new RuntimeException('向量已删除，等待清理任务状态');
+		@unlink(rtrim(TEMP_PATH, '/\\').'/airag-vector-'.$fileID.'.json');
+	}
+
+	private function retryDeletes() {
+		$deadline = microtime(true) + 10;
+		$rows = Model($this->stateTable)->where(array('status' => self::ST_DELETE))->order('indexTime asc')->limit(5)->select();
+		foreach ((array)$rows as $row) {
+			if (microtime(true) >= $deadline) break;
+			AiRagBackpressure::assertReady($this->getConfig());
+			try { $this->dropFile(intval($row['fileID'])); }
+			catch (Throwable $e) { $this->log('delete retry fileID='.$row['fileID'].' '.$e->getMessage(), 'warning'); }
+		}
 	}
 
 	public function manage() {
@@ -768,6 +819,7 @@ class aiRagPlugin extends PluginBase {
 					'error' => '已禁用',
 					'indexTime' => time(),
 				));
+				$this->retrievalPolicy = null;
 				return show_json(array('message' => '已禁用，不再参与检索与提问'));
 			}
 			if ($operation === 'dropLibrary') {
@@ -1082,7 +1134,7 @@ class aiRagPlugin extends PluginBase {
 		static $loaded = false;
 		if ($loaded) return;
 		$dir = $this->pluginPath.'lib/';
-		foreach (array('HttpJson','TextNormalizer','TextChunker','IndexLock','Backpressure','ElasticStore','MilvusStore','EmbedClient','ChatClient','HybridRetriever','WebSearch','ModelHub','CorpusShare') as $name) {
+		foreach (array('HttpJson','TextNormalizer','TextChunker','IndexLock','Backpressure','ElasticStore','MilvusStore','EmbedClient','ChatClient','HybridRetriever','WebSearch','ModelHub','CorpusShare','RetrievalPolicy') as $name) {
 			include_once($dir.$name.'.class.php');
 		}
 		$loaded = true;
@@ -1110,7 +1162,13 @@ class aiRagPlugin extends PluginBase {
 		$options['readOnly'] = true;
 		return new AiRagElasticStore($options);
 	}
-	private function milvus($config = null) { return new AiRagMilvusStore($config !== null ? $config : $this->getConfig()); }
+	private function milvus($config = null) {
+		$config = $config !== null ? $config : $this->getConfig();
+		$config['modelVersion'] = $this->embed($config)->fingerprint();
+		$key = sha1(json_encode($config));
+		if (!isset($this->milvusStores[$key])) $this->milvusStores[$key] = new AiRagMilvusStore($config);
+		return $this->milvusStores[$key];
+	}
 	private function embed($config = null) {
 		$config = $config !== null ? $config : $this->getConfig();
 		if (trim((string)_get($config, 'embedUrl', '')) === '') {
@@ -1129,9 +1187,14 @@ class aiRagPlugin extends PluginBase {
 		$parsed = AiRagModelHub::parse(_get($config, 'modelServices', ''), AiRagModelHub::defaults($config));
 		return $parsed ? $parsed : AiRagModelHub::defaults($config);
 	}
+	private function policy() {
+		if ($this->retrievalPolicy === null) $this->retrievalPolicy = new AiRagRetrievalPolicy($this->getConfig());
+		return $this->retrievalPolicy;
+	}
+
 	private function retriever($config = null) {
 		$config = $config !== null ? $config : $this->getConfig();
-		return new AiRagHybridRetriever($this->elastic($config), $this->milvus($config), $this->embed($config));
+		return new AiRagHybridRetriever($this->elastic($config), $this->milvus($config), $this->policy());
 	}
 
 	public function chat() {
@@ -1160,30 +1223,25 @@ class aiRagPlugin extends PluginBase {
 		}
 		if ($operation === 'delete') {
 			$id = (string)_get($this->in, 'id', '');
-			$store['items'] = array_values(array_filter((array)_get($store, 'items', array()), function($item) use ($id) {
-				return _get($item, 'id', '') !== $id;
-			}));
-			$this->chatSaveStore($store);
+			$this->chatUpdate(function(&$store) use ($id) {
+				$store['items'] = array_values(array_filter($store['items'], function($item) use ($id) { return _get($item, 'id', '') !== $id; }));
+			});
 			return show_json(array('message' => '已删除'));
 		}
 		if ($operation === 'flag') {
 			$id = (string)_get($this->in, 'id', '');
 			$index = intval(_get($this->in, 'index', -1));
 			$star = intval(_get($this->in, 'star', 0)) ? 1 : 0;
-			$item = $this->chatFind($store, $id);
+			$item = $this->chatUpdate(function(&$store) use ($id, $index, $star) {
+				foreach ($store['items'] as &$item) {
+					if ($item['id'] !== $id) continue;
+					if ($index >= 0 && isset($item['messages'][$index])) $item['messages'][$index]['starred'] = $star;
+					else $item['starred'] = $star;
+					return $item;
+				}
+				return null;
+			});
 			if (!$item) return show_json(array('message' => '对话不存在'), false);
-			if ($index >= 0 && isset($item['messages'][$index])) {
-				$item['messages'][$index]['starred'] = $star;
-			} else {
-				$item['starred'] = $star;
-			}
-			$items = array();
-			foreach ((array)$store['items'] as $row) {
-				if ($row['id'] !== $item['id']) $items[] = $row;
-			}
-			array_unshift($items, $item);
-			$store['items'] = $items;
-			$this->chatSaveStore($store);
 			return show_json(array('item' => $item, 'message' => $star ? '已收藏' : '已取消收藏'));
 		}
 		// 资源管理器里的入库标记：普通用户也需要，路径可见性由 IO::info 自行校验
@@ -1193,6 +1251,7 @@ class aiRagPlugin extends PluginBase {
 		}
 		if ($operation === 'source') {
 			$fileID = intval(_get($this->in, 'fileID', 0));
+			if (!$this->visibleFileIDs(array($fileID))) return show_json(array('message' => '没有权限查看该文件或文件已停用'), false);
 			$detail = $this->fileDetail($fileID);
 			$item = (array)_get($detail, 'item', array());
 			$path = (string)_get($item, 'path', '');
@@ -1574,7 +1633,7 @@ class aiRagPlugin extends PluginBase {
 			$file = $this->attachSourceMeta($file);
 			$want = KodboxCorpusShare::ancestorIDs($fileID);
 			$file['ancestorIDs'] = $want;
-			try { $existing = $milvus->hashesByFile($fileID); } catch (Throwable $e) { $errors++; continue; }
+			try { $existing = $milvus->hashesByFile($fileID, max(4096, intval(_get($state, 'chunkCount', 0)))); } catch (Throwable $e) { $errors++; continue; }
 			$need = array();
 			foreach ((array)$existing as $index => $old) {
 				if (!$this->sameAncestors(_get($old, 'ancestor_ids', array()), $want)) $need[] = intval($index);
@@ -1644,12 +1703,14 @@ class aiRagPlugin extends PluginBase {
 
 	private function visibleFileIDs($fileIDs) {
 		$ids = array_values(array_unique(array_filter(array_map('intval', (array)$fileIDs))));
-		if (!$ids || !class_exists('KodIO') || !class_exists('KodUser') || !function_exists('Action') || !function_exists('Model')) return $ids;
+		if (!$ids || !class_exists('KodIO') || !class_exists('KodUser') || !function_exists('Action') || !function_exists('Model')) return array();
+		try { $ids = $this->policy()->allowedIDs($ids); } catch (Throwable $e) { return array(); }
+		if (!$ids) return array();
 		try { if (KodUser::isRoot()) return $ids; } catch (Throwable $e) {}
 		$cap = min(2000, max(200, count($ids) * 24));
 		try { $rows = Model('Source')->where(array('fileID' => array('in', $ids), 'isFolder' => 0, 'isDelete' => 0))->field('fileID,sourceID')->limit($cap)->select(); }
-		catch (Throwable $e) { return $ids; }
-		$auth = Action('explorer.auth');
+		catch (Throwable $e) { return array(); }
+		try { $auth = Action('explorer.auth'); } catch (Throwable $e) { return array(); }
 		$ok = array();
 		foreach ((array)$rows as $row) {
 			$fid = intval(_get($row, 'fileID', 0));
@@ -2060,6 +2121,7 @@ class aiRagPlugin extends PluginBase {
 		$status = intval(_get($row, 'status', 0));
 		$map = array(
 			self::ST_WAIT => array('text' => '等待正文', 'cls' => 'is-wait'),
+			self::ST_DELETE => array('text' => '等待删除', 'cls' => 'is-wait'),
 			self::ST_ES => array('text' => '待向量化', 'cls' => 'is-wait'),
 			self::ST_OK => array('text' => '已完成', 'cls' => 'is-ok'),
 			self::ST_SKIP => array('text' => ((string)_get($row, 'error', '') === '已禁用' ? '已禁用' : '已跳过'), 'cls' => 'is-skip'),
@@ -2214,15 +2276,32 @@ class aiRagPlugin extends PluginBase {
 
 	private function chatStore() {
 		$file = $this->chatFile();
-		$data = is_file($file) ? json_decode(@file_get_contents($file), true) : array();
-		if (!is_array($data)) $data = array();
-		if (!isset($data['items']) || !is_array($data['items'])) $data['items'] = array();
+		if (!is_file($file)) return array('items' => array());
+		$raw = file_get_contents($file);
+		$data = $raw === false ? null : json_decode($raw, true);
+		if (!is_array($data) || !isset($data['items']) || !is_array($data['items'])) throw new RuntimeException('对话记录读取失败，未覆盖现有数据');
 		return $data;
 	}
 
-	private function chatSaveStore($store) {
-		$store['items'] = array_slice(array_values((array)_get($store, 'items', array())), 0, 50);
-		@file_put_contents($this->chatFile(), json_encode($store, JSON_UNESCAPED_UNICODE), LOCK_EX);
+	private function chatUpdate($mutate) {
+		$file = $this->chatFile();
+		// A stable separate lock survives atomic replacement of the JSON file.
+		$lock = fopen($file.'.lock', 'c');
+		if (!$lock) throw new RuntimeException('无法锁定对话记录');
+		try {
+			if (!flock($lock, LOCK_EX)) throw new RuntimeException('无法锁定对话记录');
+			$store = $this->chatStore();
+			$result = $mutate($store);
+			$store['items'] = array_slice(array_values($store['items']), 0, 50);
+			$json = json_encode($store, JSON_UNESCAPED_UNICODE);
+			if ($json === false) throw new RuntimeException('对话记录编码失败');
+			$tmp = tempnam(dirname($file), '.chat-');
+			if ($tmp === false) throw new RuntimeException('无法保存对话记录');
+			try {
+				if (file_put_contents($tmp, $json) !== strlen($json) || !rename($tmp, $file)) throw new RuntimeException('无法保存对话记录');
+			} finally { if (is_file($tmp)) unlink($tmp); }
+			return $result;
+		} finally { flock($lock, LOCK_UN); fclose($lock); }
 	}
 
 	private function chatFind($store, $id) {
@@ -2233,35 +2312,35 @@ class aiRagPlugin extends PluginBase {
 	}
 
 	private function chatUpsert($id, $title, $model, $thinking, $tools, $refs, $question, $answer, $reasoning, $sources, $note, $extra = array()) {
-		$store = $this->chatStore();
-		$item = $id ? $this->chatFind($store, $id) : null;
-		if (!$item) {
-			$item = array(
-				'id' => 'c'.dechex(time()).substr(md5(uniqid('', true)), 0, 8),
-				'title' => $title,
-				'created' => time(),
-				'messages' => array(),
-			);
-		}
-		$item['title'] = $item['title'] ?: $title;
-		$item['updated'] = time();
-		$item['model'] = $model;
-		$item['thinking'] = $thinking ? 1 : 0;
-		$item['tools'] = is_array($tools) ? $tools : array();
-		$item['refs'] = is_array($refs) ? array_slice($refs, 0, 20) : array();
-		$item['messages'][] = array('role' => 'user', 'content' => $question, 'refs' => is_array($refs) ? array_slice($refs, 0, 20) : array());
-		$bot = array('role' => 'bot', 'content' => $answer, 'reasoning' => $reasoning, 'sources' => $sources, 'note' => $note);
-		if (is_array($extra)) $bot = array_merge($bot, $extra);
-		$item['messages'][] = $bot;
-		$item['messages'] = array_slice($item['messages'], -40);
-		$items = array();
-		foreach ((array)$store['items'] as $row) {
-			if ($row['id'] !== $item['id']) $items[] = $row;
-		}
-		array_unshift($items, $item);
-		$store['items'] = $items;
-		$this->chatSaveStore($store);
-		return $item;
+		return $this->chatUpdate(function(&$store) use ($id, $title, $model, $thinking, $tools, $refs, $question, $answer, $reasoning, $sources, $note, $extra) {
+			$item = $id ? $this->chatFind($store, $id) : null;
+			if (!$item) {
+				$item = array(
+					'id' => 'c'.dechex(time()).substr(md5(uniqid('', true)), 0, 8),
+					'title' => $title,
+					'created' => time(),
+					'messages' => array(),
+				);
+			}
+			$item['title'] = $item['title'] ?: $title;
+			$item['updated'] = time();
+			$item['model'] = $model;
+			$item['thinking'] = $thinking ? 1 : 0;
+			$item['tools'] = is_array($tools) ? $tools : array();
+			$item['refs'] = is_array($refs) ? array_slice($refs, 0, 20) : array();
+			$item['messages'][] = array('role' => 'user', 'content' => $question, 'refs' => is_array($refs) ? array_slice($refs, 0, 20) : array());
+			$bot = array('role' => 'bot', 'content' => $answer, 'reasoning' => $reasoning, 'sources' => $sources, 'note' => $note);
+			if (is_array($extra)) $bot = array_merge($bot, $extra);
+			$item['messages'][] = $bot;
+			$item['messages'] = array_slice($item['messages'], -40);
+			$items = array();
+			foreach ((array)$store['items'] as $row) {
+				if ($row['id'] !== $item['id']) $items[] = $row;
+			}
+			array_unshift($items, $item);
+			$store['items'] = $items;
+			return $item;
+		});
 	}
 
 	private function applySaves($answer) {

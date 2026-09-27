@@ -2,7 +2,7 @@
 if (PHP_SAPI !== 'cli') { http_response_code(404); exit; }
 function _get($a,$k,$d=null){return isset($a[$k])?$a[$k]:$d;}
 function write_log($m){throw new RuntimeException($m);}
-class PluginBase {public function getConfig(){return array();}}
+class PluginBase {public function getConfig(){return array('embedUrl'=>'mock');}}
 class FakeModel {
  public static $row=array();
  public function getConfig($name){return array('elasticUrl'=>'http://corpus:9200','indexName'=>'canonical');}
@@ -16,6 +16,7 @@ class AiRagHttpJson {
  public static function fixUrl($v){return $v;}
  public static function request($method,$url){self::$calls[]=array($method,$url);return self::$doc;}
 }
+class AiRagEmbedClient {function __construct($c){} function fingerprint(){return 'test-model';}}
 class AiRagMilvusStore {public static $deleted=array();public function __construct($c){} public function deleteFile($id){self::$deleted[]=$id;}}
 define('TEMP_PATH',sys_get_temp_dir());
 require __DIR__.'/../lib/CorpusShare.class.php';
@@ -48,4 +49,7 @@ FakeModel::$row=array('status'=>3,'error'=>'已禁用','modifyTime'=>90);
 check($extract->invoke($app,$f,'txt',array())===false,'updated source does not reactivate disabled file');
 $r->getMethod('dropFile')->invoke($app,42);
 check(AiRagMilvusStore::$deleted===array(42) && !FakeModel::$row,'drop removes own vectors and state');
+FakeModel::$row=array('fileID'=>42,'status'=>3,'error'=>'超过大小限制','modifyTime'=>100);
+$large=array('fileID'=>42,'modifyTime'=>100,'name'=>'test.txt','size'=>40*1024*1024);
+check($extract->invoke($app,$large,'txt',array('maxFileSizeMB'=>50))==='ok','raising size limit automatically requeues unchanged skipped files');
 foreach(AiRagHttpJson::$calls as $call)check($call[0]==='GET','all corpus requests are read only');

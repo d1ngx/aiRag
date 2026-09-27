@@ -68,14 +68,20 @@ class AiRagEmbedClient {
 		$data = _get($response, 'data', array());
 		$vectors = array();
 		foreach ((array)$data as $item) {
-			$vectors[] = array_map('floatval', (array)_get($item, 'embedding', array()));
+			$index = _get($item, 'index', null);
+			if (!is_int($index) || $index < 0 || $index >= count($texts) || array_key_exists($index, $vectors)) throw new Exception('Embedding 返回无效、重复或缺失的 index');
+			$values = _get($item, 'embedding', null);
+			if (!is_array($values)) throw new Exception('Embedding 返回无效向量');
+			foreach ($values as $value) if (!is_int($value) && !is_float($value)) throw new Exception('Embedding 返回非数值');
+			$vectors[$index] = array_map('floatval', $values);
 		}
+		ksort($vectors, SORT_NUMERIC);
 		foreach ($vectors as $vector) {
 			if (count($vector) !== $this->dim) throw new Exception('Embedding 维度与配置不一致，请确认模型及集合维度');
 			foreach ($vector as $value) if (!is_finite($value)) throw new Exception('Embedding 返回非有限数值');
 		}
 		if (count($vectors) !== count($texts)) throw new Exception('Embedding count mismatch');
-		return $vectors;
+		return array_values($vectors);
 	}
 
 	public function embedQuery($text, $timeout = 20) {

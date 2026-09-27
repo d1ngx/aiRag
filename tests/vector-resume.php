@@ -49,4 +49,14 @@ try {
  AiRagHttpJson::$failWrite=false;check($method->invoke($app,$file,$app->getConfig())==='ok'&&count(AiRagHttpJson::$rows)===100,'successful replacement deletes stale tail');
  AiRagHttpJson::$failRead=true;AiRagEmbedClient::$texts=array();file_put_contents(TEMP_PATH.'/airag-vector-42.json',json_encode(array('written'=>100)));
  check($method->invoke($app,$file,$app->getConfig())==='fail'&&!AiRagEmbedClient::$texts,'read error never trusts a local checkpoint');
+ AiRagHttpJson::$failRead=false;AiRagEmbedClient::$texts=array();AiRagTextChunker::$changed=true;
+ check($method->invoke($app,$file,$app->getConfig(),0,1,1,microtime(true)-1)==='yield'&&!AiRagEmbedClient::$texts&&FakeModel::$state['status']===1,'expired budget yields without embedding and keeps task pending');
+ AiRagTextChunker::$changed=false;AiRagTextChunker::$count=9001;
+ check($method->invoke($app,$file,$app->getConfig())==='ok'&&count(AiRagHttpJson::$rows)===9001,'long document vectorization completes beyond 4096 chunks');
+ AiRagTextChunker::$count=50;AiRagTextChunker::$changed=true;AiRagHttpJson::$failWrite=true;
+ check($method->invoke($app,$file,$app->getConfig())==='fail'&&FakeModel::$state['chunkCount']===9001,'failed shorter replacement preserves full old vector extent');
+ $r->getMethod('saveState')->invoke($app,$file,5,0,'','waiting');
+ check(FakeModel::$state['chunkCount']===9001,'waiting for corpus does not lose cleanup extent');
+ AiRagHttpJson::$failWrite=false;
+ check($method->invoke($app,$file,$app->getConfig())==='ok'&&count(AiRagHttpJson::$rows)===50&&!isset(AiRagHttpJson::$rows['42:9000']),'resumed shorter document deletes stale tail across all hash pages');
 } finally {foreach(glob(TEMP_PATH.'/*') as $f)unlink($f);rmdir(TEMP_PATH);}

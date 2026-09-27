@@ -127,7 +127,7 @@ class AiRagElasticStore {
 				'fields' => array('content' => array('fragment_size' => 240, 'number_of_fragments' => 1)),
 			),
 		);
-		$clauses = array();
+		$clauses = $this->policyClauses($filter);
 		if ($fileIDs !== null && !array_filter(array_map('intval',(array)$fileIDs))) return array();
 		$fileIDs = array_values(array_filter(array_map('intval', (array)$fileIDs)));
 		if ($fileIDs) $clauses[] = array('terms' => array('fileID' => $fileIDs));
@@ -180,7 +180,7 @@ class AiRagElasticStore {
 			),
 		);
 		$filter = is_array($filter) ? $filter : array();
-		$clauses = array();
+		$clauses = $this->policyClauses($filter);
 		if (!empty($filter['missingAncestors'])) $clauses[] = array('bool' => array('must_not' => array(array('exists' => array('field' => 'ancestorIDs')))));
 		$pageIDs = array_values(array_filter(array_map('intval', (array)_get($filter, 'fileIDs', array()))));
 		if (array_key_exists('fileIDs', $filter) && !$pageIDs) return array('hits' => array(), 'after' => null, 'more' => false);
@@ -207,6 +207,20 @@ class AiRagElasticStore {
 			if (count($sort) >= 2) $after = array($sort[0], intval($sort[1]));
 		}
 		return array('hits' => $hits, 'after' => $after, 'more' => count($hits) >= $body['size']);
+	}
+
+	private function policyClauses($filter) {
+		$filter = is_array($filter) ? $filter : array();
+		$clauses = array();
+		if (array_key_exists('extensions', $filter)) {
+			$exts = array_values((array)$filter['extensions']);
+			$clauses[] = $exts ? array('terms' => array('ext' => $exts)) : array('match_none' => new stdClass());
+		}
+		if (!empty($filter['maxBytes'])) $clauses[] = array('range' => array('size' => array('gt' => 0, 'lt' => intval($filter['maxBytes']))));
+		$excluded = array_values(array_filter(array_map('intval', (array)_get($filter, 'excludeFileIDs', array()))));
+		// Keep individual terms queries below Elasticsearch's default terms-count limit.
+		foreach (array_chunk($excluded, 10000) as $ids) $clauses[] = array('bool' => array('must_not' => array(array('terms' => array('fileID' => $ids)))));
+		return $clauses;
 	}
 
 	public function deleteFile($fileID) {

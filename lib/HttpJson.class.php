@@ -58,8 +58,8 @@ class AiRagHttpJson {
 			CURLOPT_HTTPHEADER => $headerLines,
 			CURLOPT_CONNECTTIMEOUT => 12,
 			CURLOPT_TIMEOUT => max(8, intval($timeout)),
-			CURLOPT_SSL_VERIFYPEER => false,
-			CURLOPT_SSL_VERIFYHOST => 0,
+			CURLOPT_SSL_VERIFYPEER => true,
+			CURLOPT_SSL_VERIFYHOST => 2,
 			CURLOPT_WRITEFUNCTION => function($ch, $chunk) use (&$buffer, &$raw, $onLine) {
 				$raw .= $chunk;
 				$buffer .= $chunk;
@@ -105,8 +105,8 @@ class AiRagHttpJson {
 			CURLOPT_CONNECTTIMEOUT => min(8, max(1, intval($timeout))),
 			CURLOPT_TIMEOUT => max(1, intval($timeout)),
 			CURLOPT_HTTPHEADER => $headerLines,
-			CURLOPT_SSL_VERIFYPEER => false,
-			CURLOPT_SSL_VERIFYHOST => 0,
+			CURLOPT_SSL_VERIFYPEER => true,
+			CURLOPT_SSL_VERIFYHOST => 2,
 		);
 		if (strtoupper($method) === 'HEAD') $options[CURLOPT_NOBODY] = true;
 		if ($body !== null && strtoupper($method) !== 'HEAD') {
@@ -132,8 +132,8 @@ class AiRagHttpJson {
 			CURLOPT_TIMEOUT => max(1, intval($timeout)),
 			CURLOPT_HTTPHEADER => $headerLines,
 			CURLOPT_POSTFIELDS => $fields,
-			CURLOPT_SSL_VERIFYPEER => false,
-			CURLOPT_SSL_VERIFYHOST => 0,
+			CURLOPT_SSL_VERIFYPEER => true,
+			CURLOPT_SSL_VERIFYHOST => 2,
 		));
 		return self::finish($curl, $url, $allowed);
 	}

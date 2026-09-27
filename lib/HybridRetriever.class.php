@@ -4,11 +4,13 @@ class AiRagHybridRetriever {
 	private $elastic;
 	private $milvus;
 	private $embed;
+	private $policy;
 
-	public function __construct($elastic, $milvus, $embed) {
+	public function __construct($elastic, $milvus, $embed, $policy = null) {
 		$this->elastic = $elastic;
 		$this->milvus = $milvus;
 		$this->embed = $embed;
+		$this->policy = $policy;
 	}
 
 	public function prepare($words, $vectorOn = true) {
@@ -24,6 +26,11 @@ class AiRagHybridRetriever {
 	public function search($words, $limit = 80, $esOn = true, $vectorOn = true, $fileIDs = null, $filter = null, $prepared = null) {
 		$limit = max(5, min(200, intval($limit)));
 		$filter = is_array($filter) ? $filter : array();
+		if ($this->policy) {
+			$filter = $this->policy->filters($filter);
+			if (empty($filter['extensions'])) $fileIDs = array();
+			elseif ($fileIDs !== null) $fileIDs = $this->policy->allowedIDs($fileIDs);
+		}
 		$parent = intval(_get($filter, 'parentID', 0));
 		if ($parent) unset($filter['parentID']);
 		if ($fileIDs !== null && !$fileIDs) {
@@ -38,20 +45,21 @@ class AiRagHybridRetriever {
 		$vecHits = array();
 		if ($esOn) {
 			try {
-				$esHits = $this->keywordHits($parsed['keyword'], $limit, $fileIDs, $filter, $parent);
-				if (!$esHits && $parsed['keyword'] !== $parsed['raw']) $esHits = $this->keywordHits($parsed['raw'], $limit, $fileIDs, $filter, $parent);
+				$esHits = $this->eligibleHits(function($size, $nextFilter) use ($parsed, $fileIDs, $parent) { return $this->keywordHits($parsed['keyword'], $size, $fileIDs, $nextFilter, $parent); }, $limit, $filter);
+				if (!$esHits && $parsed['keyword'] !== $parsed['raw']) $esHits = $this->eligibleHits(function($size, $nextFilter) use ($parsed, $fileIDs, $parent) { return $this->keywordHits($parsed['raw'], $size, $fileIDs, $nextFilter, $parent); }, $limit, $filter);
 			} catch (Throwable $e) {
 				$esHits = array();
 				error_log('aiRag keyword search skipped: '.$e->getMessage());
 			}
 		}
 		if ($vectorOn && is_array(_get($prepared, 'vector', null))) {
-			try { $vecHits = $this->vectorHits($prepared['vector'], $limit, $fileIDs, $filter, $parent); }
+			try { $vecHits = $this->eligibleHits(function($size, $nextFilter) use ($prepared, $fileIDs, $parent) { return $this->vectorHits($prepared['vector'], $size, $fileIDs, $nextFilter, $parent); }, $limit, $filter); }
 			catch (Throwable $e) {
 				$vecHits = array();
 				error_log('aiRag vector search skipped: '.$e->getMessage());
 			}
 		}
+
 		$wes = $keywordHeavy ? 1.6 : 0.9;
 		$wvec = $keywordHeavy ? 0.7 : 1.5;
 		$rrf = array();
@@ -92,6 +100,26 @@ class AiRagHybridRetriever {
 			'vector' => $vecHits,
 			'hybrid' => array_values($rrf),
 		);
+	}
+
+	private function eligibleHits($fetch, $limit, $filter) {
+		if (!$this->policy) return $fetch($limit, $filter);
+		$out = array();
+		$seen = array();
+		// At most four bounded fetches; never enumerate the entire disabled-file table.
+		for ($round = 0; $round < 4; $round++) {
+			$need = max(1, $limit - $this->fileCount($out));
+			$nextFilter = $filter;
+			$nextFilter['excludeFileIDs'] = array_values(array_unique(array_merge((array)_get($filter, 'excludeFileIDs', array()), array_keys($seen))));
+			$batch = (array)$fetch($need, $nextFilter);
+			$fresh = array();
+			foreach ($batch as $hit) if (!isset($seen[intval($hit['fileID'])])) $fresh[] = $hit;
+			if (!$fresh) break;
+			foreach ($fresh as $hit) $seen[intval($hit['fileID'])] = true;
+			$out = array_merge($out, $this->policy->keepHits($fresh));
+			if ($this->fileCount($out) >= $limit || count($batch) < $need) break;
+		}
+		return $this->freshRank($out);
 	}
 
 	private function keywordHits($words, $limit, $fileIDs, $filter, $parent) {
@@ -196,7 +224,7 @@ class AiRagHybridRetriever {
 		$searchIds = $scopeIds !== null ? $scopeIds : $fileIDs;
 		for ($round = 0; $round < 4 && $this->fileCount($hits) < $limit; $round++) {
 			$roundFilter = $filter;
-			if ($exclude) $roundFilter['excludeFileIDs'] = $exclude;
+			if ($exclude) $roundFilter['excludeFileIDs'] = array_values(array_unique(array_merge((array)_get($filter, 'excludeFileIDs', array()), $exclude)));
 			$need = $limit - $this->fileCount($hits);
 			$ask = $scopeIds !== null ? $need : max($need, 80);
 			$batch = $this->groupedSearch($vector, $ask, $searchIds, $roundFilter);
