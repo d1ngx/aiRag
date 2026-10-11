@@ -1,4 +1,5 @@
 <?php
+require_once __DIR__.'/Security.class.php';
 
 class AiRagHttpJson {
 	public static function fixUrl($url) {
@@ -39,7 +40,7 @@ class AiRagHttpJson {
 
 	public static function stream($url, $body, $headers = array(), $timeout = 90, $onLine = null) {
 		if (!function_exists('curl_init')) throw new Exception('PHP cURL extension is required');
-		$url = self::fixUrl($url);
+		$url = KodboxSearchSecurity::httpUrl(self::fixUrl($url));
 		if ($url === '' || !preg_match('#^https?://#i', $url)) {
 			throw new Exception(self::explain('URL 必须以 http:// 或 https:// 开头', $url));
 		}
@@ -51,6 +52,7 @@ class AiRagHttpJson {
 		}
 		$buffer = '';
 		$raw = '';
+		$total = 0;
 		curl_setopt_array($curl, array(
 			CURLOPT_URL => $url,
 			CURLOPT_POST => true,
@@ -58,10 +60,15 @@ class AiRagHttpJson {
 			CURLOPT_HTTPHEADER => $headerLines,
 			CURLOPT_CONNECTTIMEOUT => 12,
 			CURLOPT_TIMEOUT => max(8, intval($timeout)),
+			CURLOPT_FOLLOWLOCATION => false,
+			CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+			CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
 			CURLOPT_SSL_VERIFYPEER => true,
 			CURLOPT_SSL_VERIFYHOST => 2,
-			CURLOPT_WRITEFUNCTION => function($ch, $chunk) use (&$buffer, &$raw, $onLine) {
-				$raw .= $chunk;
+			CURLOPT_WRITEFUNCTION => function($ch, $chunk) use (&$buffer, &$raw, &$total, $onLine) {
+				$total += strlen($chunk);
+				if ($total > 16 * 1024 * 1024 || strlen($buffer) + strlen($chunk) > 1024 * 1024) return 0;
+				if (strlen($raw) < 1200) $raw .= substr($chunk, 0, 1200 - strlen($raw));
 				$buffer .= $chunk;
 				while (($p = strpos($buffer, "\n")) !== false) {
 					$line = rtrim(substr($buffer, 0, $p), "\r");
@@ -88,7 +95,7 @@ class AiRagHttpJson {
 
 	public static function request($method, $url, $body = null, $headers = array(), $timeout = 30, $allowed = array(200, 201)) {
 		if (!function_exists('curl_init')) throw new Exception('PHP cURL extension is required');
-		$url = self::fixUrl($url);
+		$url = KodboxSearchSecurity::httpUrl(self::fixUrl($url));
 		if ($url !== '' && !preg_match('#^https?://#i', $url)) {
 			throw new Exception(self::explain('URL 必须以 http:// 或 https:// 开头', $url));
 		}
@@ -105,6 +112,9 @@ class AiRagHttpJson {
 			CURLOPT_CONNECTTIMEOUT => min(8, max(1, intval($timeout))),
 			CURLOPT_TIMEOUT => max(1, intval($timeout)),
 			CURLOPT_HTTPHEADER => $headerLines,
+			CURLOPT_FOLLOWLOCATION => false,
+			CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+			CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
 			CURLOPT_SSL_VERIFYPEER => true,
 			CURLOPT_SSL_VERIFYHOST => 2,
 		);
@@ -118,7 +128,7 @@ class AiRagHttpJson {
 
 	public static function upload($url, $fields, $headers = array(), $timeout = 120, $allowed = array(200, 201)) {
 		if (!function_exists('curl_init')) throw new Exception('PHP cURL extension is required');
-		$url = self::fixUrl($url);
+		$url = KodboxSearchSecurity::httpUrl(self::fixUrl($url));
 		$curl = curl_init();
 		$headerLines = array('Accept: application/json');
 		foreach ((array)$headers as $key => $value) {
@@ -132,6 +142,10 @@ class AiRagHttpJson {
 			CURLOPT_TIMEOUT => max(1, intval($timeout)),
 			CURLOPT_HTTPHEADER => $headerLines,
 			CURLOPT_POSTFIELDS => $fields,
+			CURLOPT_CONNECTTIMEOUT => 8,
+			CURLOPT_FOLLOWLOCATION => false,
+			CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+			CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
 			CURLOPT_SSL_VERIFYPEER => true,
 			CURLOPT_SSL_VERIFYHOST => 2,
 		));
@@ -139,8 +153,16 @@ class AiRagHttpJson {
 	}
 
 	private static function finish($curl, $url, $allowed) {
-		$response = curl_exec($curl);
-		if ($response === false) {
+		$response = '';
+		$tooLarge = false;
+		curl_setopt($curl, CURLOPT_WRITEFUNCTION, function($ch, $chunk) use (&$response, &$tooLarge) {
+			if (strlen($response) + strlen($chunk) > 64 * 1024 * 1024) { $tooLarge = true; return 0; }
+			$response .= $chunk;
+			return strlen($chunk);
+		});
+		$result = curl_exec($curl);
+		if ($tooLarge) { curl_close($curl); throw new Exception('HTTP response exceeds 64 MB'); }
+		if ($result === false) {
 			$error = curl_error($curl);
 			curl_close($curl);
 			throw new Exception(self::explain('HTTP connection failed: '.$error, $url));

@@ -15,7 +15,12 @@ class AiRagTextNormalizer {
 			@unlink($tmp);
 			return $content;
 		}
-		$types = (string)$zip->getFromName('[Content_Types].xml');
+		$typesStat = $zip->statName('[Content_Types].xml');
+		if ($zip->numFiles > 10000 || ($typesStat && $typesStat['size'] > 1048576)) {
+			$zip->close(); @unlink($tmp);
+			throw new RuntimeException('Office 压缩包条目过多或内容类型声明超过 1 MB');
+		}
+		$types = (string)$zip->getFromName('[Content_Types].xml', 1048576);
 		$removed = 0;
 		for ($i = $zip->numFiles - 1; $i >= 0; $i--) {
 			$name = $zip->getNameIndex($i);

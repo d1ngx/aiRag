@@ -1,3 +1,15 @@
+
+(function(){
+ function install(){
+  if(!window.jQuery || window.__kodSearchRequestGuard) return;
+  window.__kodSearchRequestGuard=true;
+  jQuery.ajaxPrefilter(function(options, original, xhr){
+   var url=new URL(options.url,location.href);
+   if(url.origin===location.origin && /(?:plugin\/|plugin%2f)(?:aiRag|elasticFulltext)(?:\/|%2f)/i.test(url.href)) xhr.setRequestHeader('X-Kodbox-Plugin','1');
+  });
+ }
+ install(); if(window.kodReady) kodReady.push(install);
+})();
 (function(){
 function boot(){
 	if(window.__aiRagAdminReady)return;
@@ -72,7 +84,7 @@ function boot(){
 		v=v.replace(/\/+embeddings$/i,'');
 		return v.replace(/\/+$/,'');
 	}
-	function h(s){return $('<div>').text(s==null?'':s).html();}
+	function h(s){return String(s==null?'':s).replace(/[&<>\"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c];});}
 	function ico(name){
 		var paths={
 			edit:'<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/>',

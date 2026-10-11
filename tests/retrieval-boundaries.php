@@ -6,6 +6,8 @@ class ES {public $calls=0;function search($q,$n,$ids,$filter){$this->calls++;ret
 class MV {public $calls=0;function search($q,$n,$ids,$filter,$offset=0,$group=false){$this->calls++;return array(array('fileID'=>8,'chunk'=>4,'rank'=>1,'text'=>'best chunk','name'=>'test','score'=>0.9),array('fileID'=>8,'chunk'=>9,'rank'=>2,'text'=>'second chunk','name'=>'test','score'=>0.4));}}
 class Embed {public $calls=0;function embedQuery($q,$timeout=8){$this->calls++;return array(1);}}
 class PluginBase {}
+class TestAuth {function fileCanRead($path){return true;}}
+function Action($name){return new TestAuth;}
 class IO {static function info($p){return array('name'=>'folder','isFolder'=>1,'parentLevel'=>',','sourceID'=>99);}}
 class FakeModel {
  public $after=0;function where($w){$this->after=isset($w['sourceID'])?intval($w['sourceID'][1]):0;return $this;}
@@ -18,7 +20,7 @@ function check($c,$m){if(!$c)throw new RuntimeException($m);echo "PASS $m\n";}
 $es=new ES;$mv=new MV;$embed=new Embed;$h=new AiRagHybridRetriever($es,$mv,$embed);
 $out=$h->search('test',10,true,true,array());check(!$out['hybrid']&&!$es->calls&&!$mv->calls&&!$embed->calls,'empty restricted scope does not search or embed');
 $out=$h->search('test');$hit=$out['hybrid'][0];check(count($hit['chunks'])===2,'multiple matches from same file retained');check($hit['chunk']===4&&$hit['snippet']==='ES overview'&&$hit['source']['vector']['text']==='best chunk','best chunk stays aligned and keyword snippet is kept');
-$r=new ReflectionClass('aiRagPlugin');$app=$r->newInstanceWithoutConstructor();$scope=$r->getMethod('resolveAskScope')->invoke($app,array('folder'));
+$r=new ReflectionClass('aiRagPlugin');$app=$r->newInstanceWithoutConstructor();$scope=$r->getMethod('resolveAskScope')->invoke($app,array('{source:99}'));
 check($scope['folderIDs']===array(99)&&!$scope['fileIDs']&&$scope['restricted'],'folder reference stays a folder filter');
 $scope=$r->getMethod('resolveAskScope')->invoke($app,array());check(!$scope['restricted'],'unrestricted scope remains distinct');
 $prepared=$h->prepare('again',true);$before=$embed->calls;

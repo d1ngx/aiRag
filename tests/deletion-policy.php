@@ -33,4 +33,9 @@ try {
  check(!DeleteModel::$row&&!is_file(TEMP_PATH.'/airag-vector-42.json'),'successful scheduled retry clears state and checkpoint');
  DeleteModel::$row=array('status'=>3,'error'=>'已禁用');
  check($r->getMethod('vectorizeFile')->invoke($app,$file,array())==='skip','manual vector retry does not reactivate disabled files');
+ DeleteModel::$row['chunkCount']=9001;
+ $r->getMethod('enableFile')->invoke($app,42);
+ check(DeleteModel::$row['status']===1&&DeleteModel::$row['error']===''&&DeleteModel::$row['chunkCount']===9001,'explicit enable queues file without losing cleanup extent');
+ DeleteModel::$row=array('status'=>6,'error'=>'pending');$denied=false;try{$r->getMethod('enableFile')->invoke($app,42);}catch(RuntimeException $e){$denied=true;}
+ check($denied&&DeleteModel::$row['status']===6,'enable cannot revive a pending deletion');
 } finally {foreach(glob(TEMP_PATH.'/*')as$f)unlink($f);rmdir(TEMP_PATH);}

@@ -1,4 +1,5 @@
 <?php
+require_once __DIR__.'/lib/Security.class.php';
 
 class aiRagPlugin extends PluginBase {
 	private $stateTable = 'plugin_airag_state';
@@ -14,6 +15,7 @@ class aiRagPlugin extends PluginBase {
 	const ST_DELETE = 6;
 	private $retrievalPolicy = null;
 	private $milvusStores = array();
+	private $readableSources = array();
 
 	public function __construct() {
 		parent::__construct();
@@ -58,35 +60,35 @@ class aiRagPlugin extends PluginBase {
 			'refs' => is_array($refs) ? $refs : array(),
 			'refsGiven' => array_key_exists('refs', (array)$this->in) || isset($_GET['refs']),
 			'compact' => intval(_get($this->in, 'compact', isset($_GET['compact']) ? $_GET['compact'] : 0)) === 1 ? 1 : 0,
+			'isAdmin' => KodUser::isRoot(),
 			'models' => AiRagModelHub::chatModels($this->services()),
 			'model' => (string)_get($this->getConfig(), 'llmModel', ''),
 			'imageModels' => $this->typedModels($this->services(), 'image', true),
+			'asrModels' => $this->typedModels($this->services(), 'asr', true),
 			'staticPath' => defined('STATIC_PATH') ? STATIC_PATH : ((defined('APP_HOST') ? APP_HOST : '').'static/'),
 		);
 		include $this->pluginPath.'static/page.html';
 	}
 
 	public function media() {
+		if (!KodboxSearchSecurity::protect($this->in, true)) return;
 		if (_get($_SERVER, 'REQUEST_METHOD', '') !== 'POST') return show_json(LNG('common.illegalRequest'), false);
 		if (!KodUser::isLogin()) return show_json('请先登录', false);
 		$this->releaseSession();
 		$config = $this->getConfig();
 		$operation = trim((string)_get($this->in, 'operation', 'image'));
-		$image = AiRagModelHub::first($this->services(), 'image');
-		$asr = AiRagModelHub::first($this->services(), 'asr');
-		$chat = AiRagModelHub::first($this->services(), 'chat');
-		$hit = $operation === 'asr' ? ($asr ?: $chat) : ($image ?: $chat);
-		$base = $hit ? $hit['url'] : AiRagChatClient::normalizeBaseUrl(_get($config, 'llmUrl', _get($config, 'embedUrl', '')));
-		$key = $hit ? $hit['apiKey'] : trim((string)_get($config, 'llmApiKey', _get($config, 'embedApiKey', '')));
-		if ($base === '') return show_json(array('message' => '未配置 API 地址'), false);
+		$type = $operation === 'asr' ? 'asr' : 'image';
+		$requested = trim((string)_get($this->in, 'model', ''));
+		$hit = $requested !== '' ? AiRagModelHub::find($this->services(), $requested, $type) : AiRagModelHub::first($this->services(), $type);
+		if (!$hit) return show_json(array('message' => '请先配置并启用对应的图片或语音模型'), false);
+		$base = $hit['url']; $key = $hit['apiKey']; $model = $hit['model']['id'];
 		$headers = array();
 		if ($key !== '') $headers['Authorization'] = 'Bearer '.$key;
 		try {
 			if ($operation === 'image') {
 				$prompt = trim((string)_get($this->in, 'prompt', ''));
 				if ($prompt === '') return show_json(array('message' => '请先描述图片'), false);
-				$model = trim((string)_get($this->in, 'model', ''));
-				if ($model === '') $model = $image ? $image['model']['id'] : 'Kwai-Kolors/Kolors';
+				if (strlen($prompt) > 16000) throw new InvalidArgumentException('图片描述过长');
 				$res = AiRagHttpJson::request('POST', $base.'/images/generations', array(
 					'model' => $model,
 					'prompt' => $prompt,
@@ -101,15 +103,7 @@ class aiRagPlugin extends PluginBase {
 				return show_json(array('url' => $url));
 			}
 			if ($operation === 'asr') {
-				if (empty($_FILES['file']['tmp_name']) || !is_uploaded_file($_FILES['file']['tmp_name'])) {
-					return show_json(array('message' => '请选择音频文件'), false);
-				}
-				$model = trim((string)_get($this->in, 'model', ''));
-				if ($model === '') $model = $asr ? $asr['model']['id'] : 'FunAudioLLM/SenseVoiceSmall';
-				$fields = array(
-					'model' => $model !== '' ? $model : 'FunAudioLLM/SenseVoiceSmall',
-					'file' => class_exists('CURLFile') ? new CURLFile($_FILES['file']['tmp_name'], _get($_FILES['file'], 'type', ''), _get($_FILES['file'], 'name', 'audio.wav')) : '@'.$_FILES['file']['tmp_name'],
-				);
+				$fields = array('model' => $model, 'file' => KodboxSearchSecurity::audioFile($_FILES['file'] ?? null));
 				$res = AiRagHttpJson::upload($base.'/audio/transcriptions', $fields, $headers, 120);
 				$text = (string)_get($res, 'text', _get($res, 'result', ''));
 				if ($text === '') $text = json_encode($res, JSON_UNESCAPED_UNICODE);
@@ -288,6 +282,9 @@ class aiRagPlugin extends PluginBase {
 	}
 
 	public function task() {
+		if (defined('MOD') && strtolower(MOD) === 'plugin') {
+			if (!KodboxSearchSecurity::protect($this->in, true) || !KodUser::isRoot()) return;
+		}
 		return $this->runLocked(false);
 	}
 
@@ -757,6 +754,15 @@ class aiRagPlugin extends PluginBase {
 		}
 	}
 
+	private function enableFile($fileID) {
+		if ($fileID <= 0) throw new InvalidArgumentException('缺少 fileID');
+		$state = Model($this->stateTable)->where(array('fileID' => $fileID))->find();
+		if (!$state || intval($state['status']) !== self::ST_SKIP || _get($state, 'error', '') !== '已禁用') throw new RuntimeException('只有明确禁用的文件可以重新启用');
+		$result = Model($this->stateTable)->where(array('fileID' => $fileID))->save(array('status' => self::ST_ES, 'error' => '', 'indexTime' => time()));
+		if ($result === false) throw new RuntimeException('启用状态保存失败');
+		$this->retrievalPolicy = null;
+	}
+
 	private function dropFile($fileID) {
 		$fileID = intval($fileID);
 		// Persist the tombstone before remote I/O. Failed deletes remain excluded and retryable.
@@ -780,12 +786,13 @@ class aiRagPlugin extends PluginBase {
 	}
 
 	public function manage() {
+		if (!KodboxSearchSecurity::protect($this->in, true)) return;
 		if (_get($_SERVER, 'REQUEST_METHOD', '') !== 'POST') return show_json(LNG('common.illegalRequest'), false);
 		if (!KodUser::isRoot()) return show_json(LNG('explorer.noPermissionAction'), false);
 		$this->releaseSession();
 		$operation = trim(Input::get('operation', 'require'));
 		$mutationLock = null;
-		if (in_array($operation, array('rebuild', 'reset', 'dropLibrary', 'disableLibrary'), true)) {
+		if (in_array($operation, array('rebuild', 'reset', 'dropLibrary', 'disableLibrary', 'enableLibrary'), true)) {
 			$mutationLock = AiRagIndexLock::acquire('kod-heavy-index');
 			if (!$mutationLock) return show_json(array('message' => '已有索引任务在运行，请稍后再试'), false);
 		}
@@ -814,13 +821,18 @@ class aiRagPlugin extends PluginBase {
 				if (!$id) return show_json(array('message' => '缺少 fileID'), false);
 				$state = Model($this->stateTable)->where(array('fileID' => $id))->find();
 				if (!$state) return show_json(array('message' => '文件不在资源库'), false);
-				Model($this->stateTable)->where(array('fileID' => $id))->save(array(
+				$result = Model($this->stateTable)->where(array('fileID' => $id))->save(array(
 					'status' => self::ST_SKIP,
 					'error' => '已禁用',
 					'indexTime' => time(),
 				));
+				if ($result === false) throw new RuntimeException('禁用状态保存失败');
 				$this->retrievalPolicy = null;
 				return show_json(array('message' => '已禁用，不再参与检索与提问'));
+			}
+			if ($operation === 'enableLibrary') {
+				$this->enableFile(intval(_get($this->in, 'fileID', 0)));
+				return show_json(array('message' => '已启用并加入后台处理队列'));
 			}
 			if ($operation === 'dropLibrary') {
 				$id = intval(_get($this->in, 'fileID', 0));
@@ -917,6 +929,7 @@ class aiRagPlugin extends PluginBase {
 	}
 
 	public function status() {
+		if (!KodboxSearchSecurity::protect($this->in, false)) return;
 		if (!KodUser::isRoot()) return show_json(LNG('explorer.noPermissionAction'), false);
 		$this->releaseSession();
 		$fast = intval(_get($_GET, 'fast', 0)) === 1;
@@ -1198,9 +1211,10 @@ class aiRagPlugin extends PluginBase {
 	}
 
 	public function chat() {
+		if (!KodboxSearchSecurity::protect($this->in, true)) return;
 		if (!KodUser::isLogin()) return show_json('请先登录', false);
 		$operation = trim((string)_get($this->in, 'operation', 'list'));
-		$store = $this->chatStore();
+		$store = in_array($operation, array('list','get'), true) ? $this->chatStore() : array();
 		if ($operation === 'list') {
 			$list = array();
 			foreach ((array)_get($store, 'items', array()) as $item) {
@@ -1283,11 +1297,13 @@ class aiRagPlugin extends PluginBase {
 	}
 
 	public function ask() {
+		if (!KodboxSearchSecurity::protect($this->in, true)) return;
 		if (_get($_SERVER, 'REQUEST_METHOD', '') !== 'POST') return show_json(LNG('common.illegalRequest'), false);
 		if (!KodUser::isLogin()) return show_json('请先登录', false);
 		$this->releaseSession();
 		if (!_get($this->getConfig(), 'llmEnabled', 1)) return show_json(array('message' => '未开启对话能力'), false);
 		$question = trim((string)_get($this->in, 'question', ''));
+		if (strlen($question) > 32000) return show_json('问题过长，请限制在 32000 字节以内', false);
 		if ($question === '') return show_json(array('message' => '请输入问题'), false);
 		$paths = array();
 		$rawPaths = _get($this->in, 'paths', '');
@@ -1308,6 +1324,8 @@ class aiRagPlugin extends PluginBase {
 		$paths = array_values(array_unique(array_filter(array_map('trim', $paths))));
 		$history = $this->decodeJson(_get($this->in, 'history', array()));
 		if (!is_array($history)) $history = array();
+		if (strlen(json_encode($history)) > 262144) return show_json('历史内容过长，请开启新对话', false);
+		$history = array_slice($history, -40);
 		$tools = $this->decodeJson(_get($this->in, 'tools', array()));
 		if (!is_array($tools)) $tools = array();
 		$disk = array_key_exists('disk', $tools) ? !empty($tools['disk']) : true;
@@ -1701,10 +1719,10 @@ class aiRagPlugin extends PluginBase {
 		return $out;
 	}
 
-	private function visibleFileIDs($fileIDs) {
+	private function visibleFileIDs($fileIDs, $applyPolicy = true) {
 		$ids = array_values(array_unique(array_filter(array_map('intval', (array)$fileIDs))));
 		if (!$ids || !class_exists('KodIO') || !class_exists('KodUser') || !function_exists('Action') || !function_exists('Model')) return array();
-		try { $ids = $this->policy()->allowedIDs($ids); } catch (Throwable $e) { return array(); }
+		try { if ($applyPolicy) $ids = $this->policy()->allowedIDs($ids); } catch (Throwable $e) { return array(); }
 		if (!$ids) return array();
 		try { if (KodUser::isRoot()) return $ids; } catch (Throwable $e) {}
 		$cap = min(2000, max(200, count($ids) * 24));
@@ -1716,7 +1734,7 @@ class aiRagPlugin extends PluginBase {
 			$fid = intval(_get($row, 'fileID', 0));
 			$sid = intval(_get($row, 'sourceID', 0));
 			if (!$fid || !$sid || isset($ok[$fid])) continue;
-			try { if ($auth->fileCan(KodIO::make($sid), 'view')) $ok[$fid] = true; } catch (Throwable $e) {}
+			try { if ($auth->fileCanRead(KodIO::make($sid))) { $ok[$fid] = true; $this->readableSources[$fid] = $sid; } } catch (Throwable $e) {}
 		}
 		if (count((array)$rows) >= $cap) {
 			foreach ($ids as $fid) {
@@ -1726,7 +1744,7 @@ class aiRagPlugin extends PluginBase {
 				foreach ((array)$one as $row) {
 					$sid = intval(_get($row, 'sourceID', 0));
 					if (!$sid) continue;
-					try { if ($auth->fileCan(KodIO::make($sid), 'view')) { $ok[$fid] = true; break; } } catch (Throwable $e) {}
+					try { if ($auth->fileCanRead(KodIO::make($sid))) { $ok[$fid] = true; $this->readableSources[$fid] = $sid; break; } } catch (Throwable $e) {}
 				}
 			}
 		}
@@ -1739,8 +1757,8 @@ class aiRagPlugin extends PluginBase {
 		$fileIDs = array();
 		$folderIDs = array();
 		$labels = array();
-		foreach ((array)$paths as $path) {
-			if ($path === '') continue;
+		foreach (array_slice((array)$paths, 0, 100) as $path) {
+			if (!KodboxSearchSecurity::readablePath($path)) continue;
 			$info = IO::info($path);
 			if (!is_array($info) || !$info) continue;
 			$labels[] = (string)_get($info, 'name', $path);
@@ -1881,6 +1899,11 @@ class aiRagPlugin extends PluginBase {
 		if (isset($days[$timeKey])) $timeFrom = time() - $days[$timeKey] * 86400;
 		$needSource = $words !== '' || $exts || ($sizeKey && isset($sizeRange[$sizeKey])) || $sourceID;
 		$stateWhere = array();
+		if ($words !== '') {
+			$nameFilter = array('src.name' => array('like', '%'.$words.'%'));
+			if (ctype_digit($words)) { $nameFilter['src.fileID'] = intval($words); $nameFilter['_logic'] = 'OR'; }
+			$stateWhere['_complex'] = $nameFilter;
+		}
 		if ($statusWant !== null) $stateWhere['st.status'] = $statusWant;
 		if ($timeFrom) $stateWhere['st.modifyTime'] = array('egt', $timeFrom);
 		$join = $needSource ? $this->libraryJoin($words, $exts, ($sizeKey && isset($sizeRange[$sizeKey])) ? $sizeRange[$sizeKey] : null, $sourceID) : '';
@@ -1954,12 +1977,6 @@ class aiRagPlugin extends PluginBase {
 		if (is_array($sizeRange)) {
 			$parts[] = 'src.size>='.intval($sizeRange[0]);
 			if ($sizeRange[1] < PHP_INT_MAX) $parts[] = 'src.size<'.intval($sizeRange[1]);
-		}
-		$words = str_replace(array('%', '_', '\\', "'"), '', (string)$words);
-		if ($words !== '') {
-			$match = "src.name LIKE '%".$words."%'";
-			if (ctype_digit($words)) $match = '('.$match.' OR src.fileID='.intval($words).')';
-			$parts[] = $match;
 		}
 		return 'INNER JOIN io_source src ON src.fileID=st.fileID AND '.implode(' AND ', $parts);
 	}
@@ -2060,13 +2077,13 @@ class aiRagPlugin extends PluginBase {
 		$idsIn = $this->decodeJson(_get($this->in, 'fileIDs', ''));
 		$map = array();
 		$fileIDs = array();
-		foreach ((array)$idsIn as $id) {
+		foreach (array_slice((array)$idsIn, 0, 500) as $id) {
 			$id = intval($id);
 			if ($id) $fileIDs[] = $id;
 		}
-		foreach ((array)$paths as $path) {
+		foreach (array_slice((array)$paths, 0, 100) as $path) {
 			$path = is_array($path) ? (string)_get($path, 'path', '') : (string)$path;
-			if ($path === '') continue;
+			if (!KodboxSearchSecurity::readablePath($path)) continue;
 			$info = array();
 			try { $info = IO::info($path); } catch (Throwable $e) { $info = array(); }
 			$fileID = intval(_get($info, 'fileID', 0));
@@ -2075,7 +2092,8 @@ class aiRagPlugin extends PluginBase {
 				$map[$path] = $fileID;
 			}
 		}
-		$fileIDs = array_values(array_unique($fileIDs));
+		$fileIDs = $this->visibleFileIDs(array_values(array_unique($fileIDs)), false);
+		$map = array_filter($map, function($id) use ($fileIDs) { return in_array($id, $fileIDs, true); });
 		$flags = array();
 		if ($fileIDs) {
 			$rows = Model($this->stateTable)->where(array('fileID' => array('in', $fileIDs)))->select();
@@ -2110,10 +2128,14 @@ class aiRagPlugin extends PluginBase {
 	private function hydrateState($row) {
 		$fileID = intval(_get($row, 'fileID', 0));
 		$sourceID = intval(_get($row, 'sourceID', 0));
+		if (!KodUser::isRoot()) {
+			if (!isset($this->readableSources[$fileID]) && !$this->visibleFileIDs(array($fileID), false)) throw new RuntimeException('没有权限查看该文件');
+			$sourceID = $this->readableSources[$fileID];
+		}
 		$src = array();
 		try {
 			if ($sourceID) $src = Model('Source')->where(array('sourceID' => $sourceID))->find();
-			if (!$src) $src = Model('Source')->where(array('fileID' => $fileID, 'isFolder' => 0))->find();
+			if (!$src && KodUser::isRoot()) $src = Model('Source')->where(array('fileID' => $fileID, 'isFolder' => 0))->find();
 		} catch (Throwable $e) { $src = array(); }
 		if ($src) $sourceID = intval(_get($src, 'sourceID', $sourceID));
 		$file = array();
@@ -2269,7 +2291,7 @@ class aiRagPlugin extends PluginBase {
 
 	private function chatFile() {
 		$dir = rtrim(TEMP_PATH, '/\\').'/airag-chat';
-		if (!is_dir($dir)) @mkdir($dir, 0755, true);
+		if (!is_dir($dir)) @mkdir($dir, 0700, true);
 		$uid = intval(KodUser::id());
 		return $dir.'/u'.$uid.'.json';
 	}
@@ -2352,17 +2374,17 @@ class aiRagPlugin extends PluginBase {
 		$home = rtrim((string)_get(Session::get('kodUser'), 'myhome', ''), '/');
 		if ($home === '') $home = '{userFolder}';
 		$dir = $home.'/AI助手';
-		try { IO::mkdir($dir); } catch (Throwable $e) {}
-		foreach ($matches as $block) {
-			$name = preg_replace('/[^\w.\-\x{4e00}-\x{9fa5}]+/u', '_', trim($block[1]));
-			$name = trim($name, '._');
-			if ($name === '') continue;
-			try {
-				IO::setContent($dir.'/'.$name, $block[2]);
-				$saved[] = $name;
-			} catch (Throwable $e) {
-				$this->log('save '.$name.': '.$e->getMessage(), 'warning');
-			}
+		$auth = Action('explorer.auth');
+		if (!ActionCall('user.authRole.authCanEdit') || !$auth->fileCan($home, 'upload') || !$auth->spaceAllow($home)) throw new RuntimeException('没有保存文件的权限或空间不足');
+		if (!IO::exist($dir)) IO::mkdir($dir);
+		if (!$auth->fileCan($dir, 'upload')) throw new RuntimeException('没有目标目录写入权限');
+		foreach (array_slice($matches, 0, 5) as $block) {
+			$name = KodboxSearchSecurity::saveName($block[1]);
+			if (strlen($block[2]) > 1048576) throw new RuntimeException('单个生成文件不能超过 1 MB');
+			$ext = pathinfo($name, PATHINFO_EXTENSION);
+			$name = substr($name, 0, -(strlen($ext)+1)).'-'.bin2hex(random_bytes(6)).'.'.$ext;
+			if (IO::setContent($dir.'/'.$name, $block[2]) === false) throw new RuntimeException('保存文件失败');
+			$saved[] = $name;
 		}
 		return array($clean === '' ? $answer : $clean, $saved);
 	}

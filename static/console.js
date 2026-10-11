@@ -1,3 +1,15 @@
+
+(function(){
+ function install(){
+  if(!window.jQuery || window.__kodSearchRequestGuard) return;
+  window.__kodSearchRequestGuard=true;
+  jQuery.ajaxPrefilter(function(options, original, xhr){
+   var url=new URL(options.url,location.href);
+   if(url.origin===location.origin && /(?:plugin\/|plugin%2f)(?:aiRag|elasticFulltext)(?:\/|%2f)/i.test(url.href)) xhr.setRequestHeader('X-Kodbox-Plugin','1');
+  });
+ }
+ install(); if(window.kodReady) kodReady.push(install);
+})();
 if(!window.__AiRagConsoleDefined){
 window.__AiRagConsoleDefined=true;
 ClassBase.define({
@@ -44,7 +56,7 @@ ClassBase.define({
 		v=v.replace(/^(https?):\/+/i,'$1://').replace(/^(https?:\/\/)\/+/i,'$1');
 		return v.replace(/\/+(chat\/)?completions$/i,'').replace(/\/+embeddings$/i,'').replace(/\/+$/,'');
 	},
-	h:function(s){return $('<div>').text(s==null?'':s).html();},
+	h:function(s){return String(s==null?'':s).replace(/[&<>\"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c];});},
 	shortName:function(id){var p=String(id||'').split('/');return p[p.length-1]||id;},
 	vendorOf:function(id){var p=String(id||'').split('/');return p.length>1?p[0]:'';},
 	guessType:function(id){
@@ -255,7 +267,7 @@ ClassBase.define({
 			'<div class="airag-filters">'+
 			'<div class="airag-dd" data-dd="time"><button type="button" class="airag-dd-btn">'+(f.time?timeLabel:'修改时间')+'</button><div class="airag-dd-menu">'+_.map(timeOpts,function(it){return '<a href="javascript:void(0)" data-time="'+it[0]+'">'+it[1]+'</a>';}).join('')+'</div></div>'+
 			'<div class="airag-dd" data-dd="status"><button type="button" class="airag-dd-btn">'+(this.libStatus?stLabel:'状态')+'</button><div class="airag-dd-menu">'+_.map(stOpts,function(it){return '<a href="javascript:void(0)" data-status="'+it[0]+'">'+it[1]+'</a>';}).join('')+'</div></div>'+
-			'<div class="airag-dd" data-dd="ext"><button type="button" class="airag-dd-btn">'+(extSel.length?extSel.join(','):'文件类型')+(extSel.length?' <i data-act="clear-ext">×</i>':'')+'</button><div class="airag-dd-menu is-grid">'+_.map(exts,function(e){return '<a href="javascript:void(0)" data-ext="'+e+'" class="'+(extSel.indexOf(e)>=0?'is-on':'')+'">'+e+'</a>';}).join('')+'</div></div>'+
+			'<div class="airag-dd" data-dd="ext"><button type="button" class="airag-dd-btn">'+(extSel.length?self.h(extSel.join(',')):'文件类型')+(extSel.length?' <i data-act="clear-ext">×</i>':'')+'</button><div class="airag-dd-menu is-grid">'+_.map(exts,function(e){return '<a href="javascript:void(0)" data-ext="'+e+'" class="'+(extSel.indexOf(e)>=0?'is-on':'')+'">'+e+'</a>';}).join('')+'</div></div>'+
 			'<div class="airag-dd" data-dd="size"><button type="button" class="airag-dd-btn">'+(f.size?sizeLabel:'不限大小')+'</button><div class="airag-dd-menu">'+_.map(sizeOpts,function(it){return '<a href="javascript:void(0)" data-size="'+it[0]+'">'+it[1]+'</a>';}).join('')+'</div></div>'+
 			'<button type="button" class="airag-dd-btn" data-act="lib-folder">'+(f.pathName?('目录: '+this.h(f.pathName)+' ×'):'限定目录')+'</button>'+
 			'<span class="spacer"></span><input class="airag-input" style="width:220px;height:34px" data-act="lib-words" placeholder="输入关键词搜索" value="'+this.h(this.libWords||'')+'"></div>'+
@@ -400,9 +412,9 @@ ClassBase.define({
 			'<div class="airag-op-menu">'+
 			'<a href="javascript:void(0)" data-act="view-file">查看文件</a>'+
 			'<a href="javascript:void(0)" data-act="probe-file">检索测试</a>'+
-			(disabled?'<a href="javascript:void(0)" data-act="retry-file">启用并重新生成</a>':'<a href="javascript:void(0)" data-act="disable-file">禁用</a>')+
+			(disabled?'<a href="javascript:void(0)" data-act="enable-file">启用并重新生成</a>':'<a href="javascript:void(0)" data-act="disable-file">禁用</a>')+
 			'<a href="javascript:void(0)" data-act="retry-file">重新生成</a>'+
-			'<a href="javascript:void(0)" data-act="drop-file">删除文件</a>'+
+			'<a href="javascript:void(0)" data-act="drop-file">移除向量索引</a>'+
 			'</div></div></td></tr>';
 	},
 	loadLibrary:function(opt){
@@ -772,12 +784,19 @@ ClassBase.define({
 		this.$root.on('click.airag','[data-act=drop-file]',function(e){
 			e.stopPropagation();
 			var id=$(this).closest('tr').attr('data-file')||$(this).attr('data-file');
-			self.confirm('从资源库移除该文件的索引？',function(){
-				self.post('manage',{operation:'dropLibrary',fileID:id}).done(function(){
-					self.notify('已从资源库移除',true);
+			self.confirm('仅移除向量与入库状态，原文件保留；后续扫描可能重新入库。若需停止检索，请使用禁用。',function(){
+				self.post('manage',{operation:'dropLibrary',fileID:id}).done(function(res){
+					self.notify((res.data&&res.data.message)||'移除失败',!!res.code);
 					self.loadLibrary();
 				});
 			});
+		});
+		this.$root.on('click.airag','[data-act=enable-file]',function(e){
+			e.stopPropagation();
+			var id=$(this).closest('tr').attr('data-file')||$(this).attr('data-file');
+			self.post('manage',{operation:'enableLibrary',fileID:id}).done(function(res){
+				self.notify((res.data&&res.data.message)||'启用失败',!!res.code);self.loadLibrary();
+			}).fail(function(){self.notify('启用失败，请重试',false);});
 		});
 		this.$root.on('click.airag','[data-act=retry-file]',function(e){
 			e.stopPropagation();

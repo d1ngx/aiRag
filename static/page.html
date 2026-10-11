@@ -50,10 +50,10 @@
 			<div class="airag-models" id="airag-models"></div>
 			<div class="airag-tools" id="airag-tools">
 				<h4>工具</h4>
-				<div class="airag-tool" data-tool="disk"><span>网盘文件能力 <span class="meta">引用后检索</span></span><i class="airag-sw is-on"></i></div>
-				<div class="airag-tool" data-tool="web"><span>联网搜索 <span class="meta">公开摘要</span></span><i class="airag-sw"></i></div>
-				<div class="airag-tool" data-tool="mail"><span>邮件发送 <span class="meta">只出草稿</span></span><i class="airag-sw"></i></div>
-				<div class="airag-tool" data-tool="save"><span>保存文件到网盘 <span class="meta">写入 AI助手</span></span><i class="airag-sw"></i></div>
+				<div class="airag-tool" role="switch" tabindex="0" aria-checked="true" data-tool="disk"><span>网盘文件能力 <span class="meta">引用后检索</span></span><i class="airag-sw is-on"></i></div>
+				<div class="airag-tool" role="switch" tabindex="0" aria-checked="false" data-tool="web"><span>联网搜索 <span class="meta">公开摘要</span></span><i class="airag-sw"></i></div>
+				<div class="airag-tool" role="switch" tabindex="0" aria-checked="false" data-tool="mail"><span>邮件发送 <span class="meta">只出草稿</span></span><i class="airag-sw"></i></div>
+				<div class="airag-tool" role="switch" tabindex="0" aria-checked="false" data-tool="save"><span>保存文件到网盘 <span class="meta">保存文本副本，不覆盖原文件</span></span><i class="airag-sw"></i></div>
 			</div>
 			<div class="airag-composer-wrap">
 				<div class="airag-refs" id="airag-refs"></div>
@@ -81,10 +81,10 @@
 		<div class="airag-view" id="view-image">
 			<div class="airag-panel">
 				<h2>图片生成</h2>
-				<textarea id="airag-image-prompt" placeholder="描述你想生成的图片，例如：蓝色风格的合同封面插画"></textarea>
+				<textarea id="airag-image-prompt" aria-label="图片描述" maxlength="8000" placeholder="描述你想生成的图片，例如：蓝色风格的合同封面插画"></textarea>
 				<div class="airag-panel-bar">
 					<button type="button" class="airag-primary" id="airag-image-go">生成</button>
-					<span id="airag-image-msg" class="airag-panel-msg"></span>
+					<span id="airag-image-msg" class="airag-panel-msg" role="status" aria-live="polite"></span>
 				</div>
 				<div class="airag-image-out" id="airag-image-out"></div>
 			</div>
@@ -92,11 +92,11 @@
 		<div class="airag-view" id="view-asr">
 			<div class="airag-panel">
 				<h2>语音转文本</h2>
-				<p class="airag-help">选择音频文件，使用硅基流动 SenseVoice 识别。</p>
-				<input type="file" id="airag-asr-file" accept="audio/*,.wav,.mp3,.m4a,.ogg">
+				<p class="airag-help">支持 MP3、WAV、OGG、FLAC、M4A、WebM，最大 25 MB。使用已启用的语音模型识别。</p>
+				<input type="file" id="airag-asr-file" aria-label="选择音频文件" accept="audio/*,.wav,.mp3,.m4a,.ogg,.flac,.webm">
 				<div class="airag-panel-bar">
 					<button type="button" class="airag-primary" id="airag-asr-go">开始识别</button>
-					<span id="airag-asr-msg" class="airag-panel-msg"></span>
+					<span id="airag-asr-msg" class="airag-panel-msg" role="status" aria-live="polite"></span>
 				</div>
 				<pre class="airag-asr-out" id="airag-asr-out"></pre>
 			</div>
@@ -104,8 +104,8 @@
 	</section>
 </div>
 <script>
-window.AIRAG_API = <?php echo json_encode(rtrim(isset($this->pluginApi) ? $this->pluginApi : './index.php?plugin/aiRag/', '/').'/', JSON_UNESCAPED_SLASHES); ?>;
-window.AIRAG_BOOT = <?php echo json_encode(isset($this->airagBoot) ? $this->airagBoot : array(), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES); ?>;
+window.AIRAG_API = <?php echo json_encode(rtrim(isset($this->pluginApi) ? $this->pluginApi : './index.php?plugin/aiRag/', '/').'/', JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
+window.AIRAG_BOOT = <?php echo json_encode(isset($this->airagBoot) ? $this->airagBoot : array(), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
 </script>
 <?php echo '<script src="'.$this->pluginHost.'static/page.js?v='.intval(@filemtime($this->pluginPath.'static/page.js')).'"></script>'; ?>
 </body>

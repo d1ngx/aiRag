@@ -5,6 +5,7 @@ use Exception;
 use RuntimeException;
 function _get($a,$k,$d=null){return isset($a[$k])?$a[$k]:$d;}
 function curl_init(){return new \stdClass;}
+function curl_setopt($ch,$key,$value){$ch->options[$key]=$value;return true;}
 function curl_setopt_array($ch,$options){$ch->options=$options;return true;}
 function curl_exec($ch){
  if($ch->options[CURLOPT_SSL_VERIFYPEER]!==true||$ch->options[CURLOPT_SSL_VERIFYHOST]!==2)throw new RuntimeException('TLS peer/hostname verification is disabled');
@@ -14,7 +15,9 @@ function curl_exec($ch){
 function curl_getinfo($ch,$key){return 200;}
 function curl_close($ch){}
 $source=file_get_contents(__DIR__.'/../lib/HttpJson.class.php');
-eval('namespace AiRagTlsTest; use Exception; '.substr($source,5));
+$source=preg_replace('/require_once __DIR__[^;]+;/', '', $source);
+require_once __DIR__.'/../lib/Security.class.php';
+eval('namespace AiRagTlsTest; use \KodboxSearchSecurity; use Exception; '.substr($source,5));
 AiRagHttpJson::request('POST','https://service.invalid/v1',array());echo "PASS JSON requests verify TLS peer and hostname\n";
 AiRagHttpJson::stream('https://service.invalid/v1',array());echo "PASS streaming requests verify TLS peer and hostname\n";
 AiRagHttpJson::upload('https://service.invalid/v1',array());echo "PASS uploads verify TLS peer and hostname\n";

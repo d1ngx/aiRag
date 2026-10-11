@@ -23,7 +23,7 @@
 	function citeBtn(n, src){
 		src=src||{};
 		return '<span class="airag-cite-wrap">'+
-			'<button type="button" class="airag-cite" data-act="cite" data-n="'+n+'" data-file="'+(src.fileID||'')+'" data-chunk="'+(src.chunk==null?-1:src.chunk)+'" data-path="'+esc(src.path||'')+'" title="打开引用 '+n+'">['+n+']</button>'+
+			'<button type="button" class="airag-cite" data-act="cite" data-n="'+n+'" data-file="'+esc(src.fileID||'')+'" data-chunk="'+esc(src.chunk==null?-1:src.chunk)+'" data-path="'+esc(src.path||'')+'" title="打开引用 '+n+'">['+n+']</button>'+
 			'</span>';
 	}
 	function mdCode(lang, code){
@@ -378,7 +378,7 @@
 			if(v===undefined||v===null) return;
 			body.append(k, typeof v==='string'?v:JSON.stringify(v));
 		});
-		var opt={method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'},body:body.toString()};
+		var opt={method:'POST',credentials:'same-origin',headers:{'X-Kodbox-Plugin':'1','Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'},body:body.toString()};
 		if(extra&&extra.signal) opt.signal=extra.signal;
 		return fetch(api+path,opt)
 			.then(function(res){return res.text().then(function(text){
@@ -424,7 +424,7 @@
 	function setTool(name,on){
 		state.tools[name]=!!on;
 		document.querySelectorAll('.airag-tool').forEach(function(row){
-			if(row.getAttribute('data-tool')===name) row.querySelector('.airag-sw').classList.toggle('is-on',!!on);
+			if(row.getAttribute('data-tool')===name){row.querySelector('.airag-sw').classList.toggle('is-on',!!on);row.setAttribute('aria-checked',String(!!on));}
 		});
 	}
 	function renderRefs(){
@@ -1070,7 +1070,7 @@
 		fetch(api+'ask',{
 			method:'POST',
 			credentials:'same-origin',
-			headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','Accept':'text/event-stream, application/json'},
+			headers:{'X-Kodbox-Plugin':'1','Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','Accept':'text/event-stream, application/json'},
 			body:body.toString(),
 			signal:state.abort?state.abort.signal:undefined
 		}).then(function(res){
@@ -1385,6 +1385,7 @@
 		return Promise.resolve();
 	}
 
+	if(boot.isAdmin===false){$('airag-admin').hidden=true;if($('airag-popout')) $('airag-popout').hidden=true;}
 	$('airag-new').onclick=function(){closePop();resetChat([]);};
 	$('airag-admin').onclick=function(){openAdmin(false);};
 	if($('airag-popout')) $('airag-popout').onclick=function(){openAdmin(true);};
@@ -1398,7 +1399,7 @@
 		if(!prompt){setMsg('airag-image-msg','请先描述图片',false);return;}
 		setMsg('airag-image-msg','生成中…');
 		$('airag-image-go').disabled=true;
-		post('media',{operation:'image',prompt:prompt,model:state.model}).then(function(res){
+		post('media',{operation:'image',prompt:prompt}).then(function(res){
 			var ok=!!(res&&res.code);
 			setMsg('airag-image-msg',ok?'已生成':((res.data&&res.data.message)||res.message||'失败'),ok);
 			if(ok&&res.data&&res.data.url){
@@ -1411,12 +1412,13 @@
 		if(!mediaReady('asr')){setMsg('airag-asr-msg','没有可用的语音模型',false);return;}
 		var file=$('airag-asr-file').files&&$('airag-asr-file').files[0];
 		if(!file){setMsg('airag-asr-msg','请选择音频文件',false);return;}
+		if(!file.size || file.size>25*1024*1024){setMsg('airag-asr-msg','音频文件须大于 0 且不超过 25 MB',false);return;}
 		setMsg('airag-asr-msg','识别中…');
 		$('airag-asr-go').disabled=true;
 		var body=new FormData();
 		body.append('operation','asr');
 		body.append('file',file);
-		fetch(api+'media',{method:'POST',credentials:'same-origin',body:body}).then(function(res){return res.text().then(function(text){
+		fetch(api+'media',{method:'POST',credentials:'same-origin',headers:{'X-Kodbox-Plugin':'1'},body:body}).then(function(res){return res.text().then(function(text){
 			if(!res.ok) throw new Error('HTTP '+res.status);
 			return parseJson(text);
 		});}).then(function(res){
@@ -1529,6 +1531,7 @@
 		var id=e.target.closest('.airag-hist-item')&&e.target.closest('.airag-hist-item').getAttribute('data-id');
 		if(id) loadOne(id);
 	});
+	$('airag-tools').addEventListener('keydown',function(e){if((e.key==='Enter'||e.key===' ')&&e.target.matches('.airag-tool')){e.preventDefault();e.target.click();}});
 	$('airag-tools').addEventListener('click',function(e){
 		var row=e.target.closest('.airag-tool');
 		if(!row) return;

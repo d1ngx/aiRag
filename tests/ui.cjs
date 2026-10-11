@@ -4,19 +4,21 @@ const fs=require('node:fs');
 const path=require('node:path');
 const assert=require('node:assert/strict');
 (async()=>{
- const browser=await chromium.launch({headless:true,args:['--no-sandbox']});
+ const browser=await chromium.launch({headless:true,executablePath:process.env.AUDIT_BROWSER_PATH||undefined,args:['--no-sandbox']});
  try {
  const page=await browser.newPage({viewport:{width:1440,height:1000}});
  const errors=[]; let askCount=0;
  page.on('pageerror',e=>errors.push(e.message));
  const root=path.resolve(__dirname,'../static');
  let html=fs.readFileSync(path.join(root,'page.html'),'utf8');
- html=html.replace(/<script>[\s\S]*?<\/script>/,'<script>window.AIRAG_API="/api/";window.AIRAG_BOOT={};</script>')
+ html=html.replace(/<script>[\s\S]*?<\/script>/,'<script>window.AIRAG_API="/api/";window.AIRAG_BOOT={isAdmin:false,imageModels:[{id:"image-test"}],asrModels:[{id:"asr-test"}]};</script>')
   .replace(/<\?php echo '<script[\s\S]*?\?>/,'<script src="/static/page.js"></script>')
   .replace(/<\?php[\s\S]*?\?>/g,'/');
  await page.route('http://airag.test/**',async route=>{
   const url=new URL(route.request().url());
-  if(url.search.includes('plugin/fileThumb/cover')||url.pathname==='/thumb/input.svg') return route.fulfill({contentType:'image/svg+xml',body:'<svg xmlns="http://www.w3.org/2000/svg" width="48" height="60"><rect width="48" height="60" fill="#dbeafe"/><rect x="7" y="8" width="34" height="44" rx="3" fill="#fff"/><path d="M12 19h24M12 26h24M12 33h18" stroke="#3478f6"/></svg>'});
+  if(url.pathname.startsWith('/api/')) assert.equal(route.request().headers()['x-kodbox-plugin'],'1');
+  if(url.search.includes('plugin/fileThumb/cover')||url.pathname==='/thumb/cover_input.svg') return route.fulfill({contentType:'image/svg+xml',body:'<svg xmlns="http://www.w3.org/2000/svg" width="48" height="60"><rect width="48" height="60" fill="#dbeafe"/><rect x="7" y="8" width="34" height="44" rx="3" fill="#fff"/><path d="M12 19h24M12 26h24M12 33h18" stroke="#3478f6"/></svg>'});
+  if(url.pathname.startsWith('/static/fonts/')) return route.fulfill({contentType:'font/woff2',body:fs.readFileSync(path.join(root,'fonts',path.basename(url.pathname)))});
   if(url.pathname==='/') return route.fulfill({contentType:'text/html',body:html});
   if(url.pathname.endsWith('chat.css')||url.pathname.endsWith('page.js')) return route.fulfill({contentType:url.pathname.endsWith('.css')?'text/css':'text/javascript',body:fs.readFileSync(path.join(root,path.basename(url.pathname)),'utf8')});
   if(url.pathname==='/api/ask') {
@@ -37,13 +39,22 @@ const assert=require('node:assert/strict');
    return route.fulfill({status:200,contentType:'text/event-stream',body});
   }
   const params=new URLSearchParams(route.request().postData()||'');
-  if(url.pathname==='/api/chat'&&params.get('operation')==='get') return route.fulfill({json:{code:true,data:{item:{id:'1',title:'引用测试',refs:[{name:'test.txt',path:'{source:8}',size:1024,fileThumb:'/thumb/input.svg'}],messages:[{role:'user',content:'请总结文件',refs:[{name:'test.txt',path:'{source:8}',size:1024,fileThumb:'/thumb/input.svg'}]},{role:'assistant',content:'第一处[^1]，第二处[^2]，摘要[^3]。',provider:'Mock服务',model:'mock',usage:{prompt:120,output:30,total:150,cache:20},elapsedMs:12600,firstMs:584,speed:12.3,created:1790000000,sources:[{index:1,fileID:8,name:'test.txt',path:'{source:8}',chunk:4,chunks:900,snippet:'first excerpt'},{index:2,fileID:8,name:'test.txt',path:'{source:8}',chunk:801,chunks:900,snippet:'high excerpt'},{index:3,fileID:8,name:'test.txt',path:'{source:8}',chunk:null,snippet:'keyword summary'}]}]}}}});
+  if(url.pathname==='/api/chat'&&params.get('operation')==='get') return route.fulfill({json:{code:true,data:{item:{id:'1',title:'引用测试',refs:[{name:'test.txt',path:'{source:8}',size:1024,fileThumb:'/thumb/cover_input.svg'}],messages:[{role:'user',content:'请总结文件',refs:[{name:'test.txt',path:'{source:8}',size:1024,fileThumb:'/thumb/cover_input.svg'}]},{role:'assistant',content:'第一处[^1]，第二处[^2]，摘要[^3]。',provider:'Mock服务',model:'mock',usage:{prompt:120,output:30,total:150,cache:20},elapsedMs:12600,firstMs:584,speed:12.3,created:1790000000,sources:[{index:1,fileID:8,name:'test.txt',path:'{source:8}',chunk:4,chunks:900,snippet:'first excerpt'},{index:2,fileID:8,name:'test.txt',path:'{source:8}',chunk:801,chunks:900,snippet:'high excerpt'},{index:3,fileID:8,name:'test.txt',path:'{source:8}',chunk:null,snippet:'keyword summary'}]}]}}}});
   if(url.pathname==='/api/chat'&&params.get('operation')==='source') return route.fulfill({json:{code:true,data:{item:{name:'test.txt',chunkCount:900},chunkIndex:801,chunk:{index:801,text:'high excerpt'},chunks:[{index:0,text:'unrelated first chunk'},{index:801,text:'high excerpt'}]}}});
   if(url.pathname==='/api/chat') return route.fulfill({json:{code:true,data:{list:[{id:'1',title:'采购合同总结'},{id:'2',title:'年度报告'}],models:[{id:'mock',name:'DeepSeek-R1'}],model:'mock'}}});
   return route.fulfill({json:{code:true,data:{}}});
  });
  await page.goto('http://airag.test/');
  await page.waitForFunction(()=>document.querySelectorAll('.airag-hist-item').length===2);
+ assert.equal(await page.locator('#airag-admin').isVisible(),false);
+ await page.locator('[data-mode=asr]').click();
+ assert.equal(await page.locator('#view-asr').isVisible(),true);
+ await page.locator('[data-mode=chat]').click();
+ await page.locator('#airag-tool-btn').click();
+ await page.locator('[data-tool=web]').focus();
+ await page.keyboard.press('Space');
+ assert.equal(await page.locator('[data-tool=web]').getAttribute('aria-checked'),'true');
+ await page.locator('#airag-input').click();
  await page.locator('#airag-history-search').fill('合同');
  assert.equal(await page.locator('.airag-hist-item').count(),1);
  await page.locator('[data-prompt]').first().click();
@@ -52,18 +63,18 @@ const assert=require('node:assert/strict');
  assert.equal(askCount,0);
  await page.locator('.airag-hist-item').first().click();
  await page.locator('.airag-filecard .airag-filecover.is-card img').waitFor();
- assert.equal(await page.locator('.airag-filecard .airag-filecover.is-card img').getAttribute('src'),'/thumb/input.svg');
- assert.equal(await page.locator('#airag-refs .airag-filecover.is-chip img').getAttribute('src'),'/thumb/input.svg');
- assert.match(await page.evaluate(()=>getComputedStyle(document.body).fontFamily),/Lantinghei SC/);
- assert.match(await page.evaluate(()=>getComputedStyle(document.querySelector('#airag-input')).fontFamily),/Lantinghei SC/);
- assert.match((await page.locator('.airag-refs-box summary').textContent()).replace(/\s/g,''),/引用资料1篇$/);
+ assert.equal(await page.locator('.airag-filecard .airag-filecover.is-card img').getAttribute('src'),'/thumb/cover_input.svg');
+ assert.equal(await page.locator('#airag-refs .airag-filecover.is-chip img').getAttribute('src'),'/thumb/cover_input.svg');
+ assert.match(await page.evaluate(()=>getComputedStyle(document.body).fontFamily),/PingFang SC/);
+ assert.match(await page.evaluate(()=>getComputedStyle(document.querySelector('#airag-input')).fontFamily),/PingFang SC/);
+ assert.match((await page.locator('.airag-refs-box summary').textContent()).replace(/\s/g,''),/知识库资料引用1篇$/);
  await page.waitForFunction(()=>document.querySelector('.airag-filecard img')?.naturalWidth>0);
  const collapsedRef=await page.locator('.airag-refs-box').boundingBox();
  assert.ok(collapsedRef&&collapsedRef.width<180);
  await page.locator('.airag-refs-box summary').click();
- assert.equal(await page.locator('.airag-refs-box .airag-filecover').count(),0);
- assert.equal(await page.locator('.airag-src-title').count(),1);
- assert.equal(await page.locator('.airag-src-piece').count(),3);
+ assert.equal(await page.locator('.airag-refs-box .airag-src-file').count(),1);
+ assert.equal(await page.locator('.airag-src-file b').count(),1);
+ assert.equal(await page.locator('.airag-md .airag-cite').count(),3);
  await page.locator('.airag-stats').hover();
  await page.locator('.airag-stat-pop').waitFor({state:'visible'});
  const statText=(await page.locator('.airag-stat-pop').textContent()).replace(/\s+/g,' ');
@@ -95,6 +106,7 @@ const assert=require('node:assert/strict');
  assert.equal(askCount,2);
  assert.doesNotMatch(await page.locator('.airag-msg.bot:last-child .airag-md').textContent(),/半截回答/);
  assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+ await page.evaluate(()=>document.fonts.ready);
  await page.screenshot({path:'/tmp/airag-desktop.png',fullPage:true});
  await page.setViewportSize({width:390,height:844});
  assert.equal(await page.locator('#airag-sidebar').isVisible(),false);

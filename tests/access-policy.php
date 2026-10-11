@@ -5,7 +5,7 @@ function check($ok,$name) { if (!$ok) throw new RuntimeException($name); echo "P
 class PluginBase { public function getConfig() { return array('allowExtensions'=>'txt,pdf','maxFileSizeMB'=>50); } }
 class KodIO { static function make($id) { return (string)$id; } }
 class KodUser { static $root=false; static function isRoot() { return self::$root; } }
-class Auth { function fileCan($path,$action) { return $path === '11'; } }
+class Auth { function fileCanRead($path) { return $path === '11'; } }
 function Action($name) { return new Auth; }
 class PolicyModel {
  static $failSource=false; static $failFiles=false; static $failBlocked=false; static $blockedQueries=0; static $fileQueries=0;

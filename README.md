@@ -210,3 +210,7 @@ PLUGIN_AUDIT_MILVUS_URL=http://milvus:19530 php plugins/aiRag/tests/integration-
 ```
 
 集成测试只创建并删除随机命名的测试集合，不修改业务集合。
+
+### 1.6.27 安全与功能修复
+
+补齐插件请求防护，收紧网络、上传与 Office ZIP 边界。升级后刷新前端；自定义已认证 API 请求需增加 `X-Kodbox-Plugin: 1`。详见 [SECURITY_AUDIT.md](SECURITY_AUDIT.md)，包含代码证据、风险等级、修复方案和测试。

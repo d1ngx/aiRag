@@ -294,3 +294,8 @@ body.is-compact .airag-tools,body.is-compact .airag-models{left:16px;bottom:70px
  .airag-models,.airag-tools{max-width:calc(100vw - 24px);box-sizing:border-box}
 }
 @media(prefers-reduced-motion:reduce){.airag-page *{animation:none!important;scroll-behavior:auto!important}}
+
+.airag-tool:focus-visible,.airag-page textarea:focus-visible{outline:2px solid #3478f6;outline-offset:3px;border-radius:6px}
+.airag-page [hidden]{display:none!important}
+.airag-panel-msg{overflow-wrap:anywhere}
+.airag-tool{cursor:pointer;gap:12px;min-height:36px}
